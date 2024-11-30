@@ -1,0 +1,5 @@
+template_path: iamRole.yaml
+stack_name: sqs-fargate-consumer-v2-fargate-role
+parameters:
+  AssumingServices: 'ecs-tasks.amazonaws.com'
+  RoleNameSuffix: 'sqs-fargate-consumer-v2'

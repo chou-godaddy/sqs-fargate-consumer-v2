@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"context"
+	"fmt"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sync"
@@ -9,8 +10,8 @@ import (
 )
 
 type ConsumerController interface {
-	addWorker() error
-	removeWorker() error
+	AddWorker() error
+	RemoveWorker() error
 }
 
 type ScalerMetrics struct {
@@ -39,6 +40,9 @@ type Scaler struct {
 	consecutiveScaleUps   int
 	consecutiveScaleDowns int
 	scalingMu             sync.Mutex
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewScaler(
@@ -46,6 +50,8 @@ func NewScaler(
 	collector *metrics.Collector,
 	config *config.ConsumerGroupConfig,
 ) *Scaler {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &Scaler{
 		consumer:           consumer,
 		collector:          collector,
@@ -53,14 +59,16 @@ func NewScaler(
 		scaleUpThreshold:   config.ScaleUpThreshold,
 		scaleDownThreshold: config.ScaleDownThreshold,
 		metricsWindow:      make([]ScalerMetrics, 0, 100),
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 }
 
 func (s *Scaler) Start(ctx context.Context) error {
 	// Fast evaluation ticker for quick response to spikes
-	fastTicker := time.NewTicker(5 * time.Second)
+	fastTicker := time.NewTicker(s.config.ScalingUpTicker.Duration)
 	// Slower evaluation ticker for scale-down decisions
-	slowTicker := time.NewTicker(30 * time.Second)
+	slowTicker := time.NewTicker(s.config.ScalingDownTicker.Duration)
 
 	defer fastTicker.Stop()
 	defer slowTicker.Stop()
@@ -191,6 +199,7 @@ func (s *Scaler) scaleUpWorkers(scaleFactor int) {
 	maxNewWorkers := s.config.MaxWorkers - currentMetrics.WorkerCount
 
 	if maxNewWorkers <= 0 {
+		fmt.Println("Cannot scale up, already at max workers")
 		return
 	}
 
@@ -200,7 +209,7 @@ func (s *Scaler) scaleUpWorkers(scaleFactor int) {
 
 	success := true
 	for i := 0; i < scaleFactor; i++ {
-		if err := s.consumer.addWorker(); err != nil {
+		if err := s.consumer.AddWorker(); err != nil {
 			success = false
 			break
 		}
@@ -211,11 +220,13 @@ func (s *Scaler) scaleUpWorkers(scaleFactor int) {
 		s.consecutiveScaleDowns = 0
 		s.lastScaleUp = time.Now()
 	}
+
+	fmt.Printf("Scaled up by %v workers", scaleFactor)
 }
 
 func (s *Scaler) scaleDownWorkers() {
 	// Scale down one worker at a time
-	if err := s.consumer.removeWorker(); err == nil {
+	if err := s.consumer.RemoveWorker(); err == nil {
 		s.consecutiveScaleDowns++
 		s.consecutiveScaleUps = 0
 		s.lastScaleDown = time.Now()
@@ -322,4 +333,8 @@ func (s *Scaler) isConsistentlyBelowThreshold() bool {
 	}
 
 	return true
+}
+
+func (s *Scaler) Shutdown(ctx context.Context) {
+	s.cancel()
 }

@@ -1,0 +1,4 @@
+team_prefix: 'rg0'
+project_code: 'rg0'
+region: {{ var.region }}
+env: {{ var.env }}

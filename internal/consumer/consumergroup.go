@@ -71,7 +71,7 @@ func (c *ConsumerGroup) Start(ctx context.Context) error {
 
 	// Start initial workers
 	for i := 0; i < c.config.MinWorkers; i++ {
-		if err := c.addWorker(); err != nil {
+		if err := c.AddWorker(); err != nil {
 			// Critical failure during initialization
 			return fmt.Errorf("fatal error starting initial workers: %w", err)
 		}
@@ -109,7 +109,7 @@ func (c *ConsumerGroup) returnWorkerID(id int32) {
 	})
 }
 
-func (c *ConsumerGroup) addWorker() error {
+func (c *ConsumerGroup) AddWorker() error {
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
@@ -155,7 +155,7 @@ func (c *ConsumerGroup) addWorker() error {
 	return nil
 }
 
-func (c *ConsumerGroup) removeWorker() error {
+func (c *ConsumerGroup) RemoveWorker() error {
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 

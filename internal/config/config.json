@@ -1,0 +1,178 @@
+{
+    "apiName": "sqs-fargate-consumer-v2",
+    "env": "{{.Env}}",
+    "region": "{{.Region}}",
+    "logging": {
+      "app": "sqs-fargate-consumer-v2",
+      "enabled": true,
+      "level": "INFO",
+      "json": true
+    },
+    "monitoring": {
+      "enabled": false,
+      "APMSecret": "essp_apm_deployment"
+    },
+    "httpConfig": {
+      "MaxConnections": 100,
+      "TimeoutMs": 90000,
+      "APMEnabled": false
+    },
+    "server": {
+      "apiType": "GIN",
+      "address": ":443",
+      "shutdownTimeout": 90,
+      "tlsConfig": {"generate": true}
+    },
+    "sso": {
+      "url": {{if eq .Env "dev"}}"https://sso.dev-godaddy.com"{{ else if eq .Env "test" }}"https://sso.test-godaddy.com"{{ else if eq .Env "prod" }}"https://sso.godaddy.com"{{ else if eq .Env "ote" }}"https://sso.ote-godaddy.com"{{ end }},
+      "expireLevel": 1,
+      "commonNames": {
+      "registrar.{{.Env}}.client.int.godaddy.com": "registrar services client cert"
+      },
+      "iamClientConfig": {
+        "ssoURL": {{if eq .Env "dev"}}"sso.dev-godaddy.com"{{ else if eq .Env "dev-private"}}"sso.dev-godaddy.com"{{ else if eq .Env "test" }}"sso.test-godaddy.com"{{ else if eq .Env "prod" }}"sso.godaddy.com"{{ else if eq .Env "ote" }}"sso.ote-godaddy.com"{{ end }},
+        "primaryRegion": {{if eq .Env "dev"}}"us-west-2"{{ else if eq .Env "dev-private" }}"us-west-2"{{ else if eq .Env "test" }}"us-west-2"{{ else if eq .Env "prod" }}"{{.Region}}"{{ else if eq .Env "ote" }}"{{.Region}}"{{ end }},
+        "secondaryRegions": [{{ if eq .Region "us-west-2"}}"us-east-1"{{ else }}"us-west-2"{{ end }}]
+      },
+      "pkCacheConfig": {
+        "memcached": {
+           "clusterName": "sso-pk-cache"
+        }
+      },
+      "jwtSecretsConfig":{
+        "IAMJWT":{
+          "AWS": {
+            "Name": "iam_jwt_token",
+            "Region": "{{.Region}}"
+          }
+        },
+        "CertJWT":{
+          "AWS": {
+            "Name": "cert_jwt_token",
+            "Region": "{{.Region}}"
+          }
+        }
+      }
+    },
+    "certConfig": {
+        "Cert": {
+          "AWS": {
+            "Name": "registrar.{{.Env}}.client.int.godaddy.com.crt",
+            "Region": "{{.Region}}"
+          }
+        },
+        "Key": {
+          "AWS": {
+            "Name": "registrar.{{.Env}}.client.int.godaddy.com.key",
+            "Region": "{{.Region}}"
+          }
+        },
+        "Chain": {
+          "AWS": {
+            "Name": "registrar.{{.Env}}.client.int.godaddy.com_intermediate_chain.crt",
+            "Region": "{{.Region}}"
+          }
+        },
+        "Root": {
+          "AWS": {
+            "Name": "ca-bundle.crt",
+            "Region": "{{.Region}}"
+          }
+        }
+    },
+    "registrarConfig": {
+      "s3": {
+        "bucket": "gd-rg0-{{.Env}}-{{.Region}}-config",
+        "path": "registrarconfig/current.json"
+      }
+    },
+    "registryConfig": {
+      "s3": {
+        "bucket": "gd-rg0-{{.Env}}-{{.Region}}-config",
+        "path": "registryconfig/current.json"
+      }
+    },
+    "logging": {
+      "app": "sqs-fargate-consumer-v2",
+      "enabled": true,
+      "level": "DEBUG",
+      "json": true
+    },
+    "stackTraceReporting": {{if eq .Env "dev"}}true{{ else if eq .Env "test" }}true{{ else }}false{{ end }},
+    "registryContactsUrl": "https://registry-contacts-api.fulfillment.domains.{{.Env}}.aws.gdcld.net",
+    "registryDomainsUrl": "https://registry-domains.fulfillment.domains.{{.Env}}.aws.gdcld.net",
+    "actionApiUrl": {{if eq .Env "dev-private"}}"https://actions.fulfillment.domains.dp.aws.gdcld.net"{{ else }}"https://actions.fulfillment.domains.{{.Env}}.aws.gdcld.net"{{end}},
+    "switchBoardApplicationName": "default|fulfillment-rules",
+    "database": "DOMAINS",
+    "sqldataApiUrl": {{if eq .Env "dev-private"}}"https://api-writer.domsql.dp.aws.gdcld.net"{{ else }}"https://api-writer.domsql.{{.Env}}.aws.gdcld.net"{{ end }},
+    "shopperApiUrl": "https://shopper.api.int.{{ if ne .Env "prod" }}{{.Env}}-{{ end }}godaddy.com",
+    "internationalContactsApiUrl": {{if eq .Env "prod" }}"https://registrarcontacts.api.phx3.int.godaddy.com"{{ else }}"https://registrarcontacts.api.int.{{.Env}}-godaddy.com"{{ end }},
+    "pprofEnabled": true,
+    "genericQueueEndpointUrl": {{if eq .Env "dev"}}"https://agentservices.phx3.int.dev-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "test"}}"https://agentservices.phx3.int.test-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{ else if eq .Env "prod" }}"https://agentservices.api.phx3.int.godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "ote"}}"https://agentservices.api.phx3.int.ote-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{end}},
+    "consumer": {
+        "maxWorkers": 100,
+        "minWorkers": 5,
+        "bufferSize": 1000,
+        "scaleUpThreshold": 0.7,
+        "scaleDownThreshold": 0.3,
+        "metricsWindow": "1m",
+        "scaleUpCooldown": "5s",
+        "scaleDownCooldown": "1m",
+        "scalingUpTicker": "5s",
+        "scalingDownTicker": "30s",
+        "queues": [
+            {
+                "url": "https://sqs.us-west-2.amazonaws.com/123456789012/high-priority-queue",
+                "name": "high-priority",
+                "priority": 3,
+                "weight": 1.0,
+                "maxBatchSize": 10,
+                "pollInterval": "1s" // Time-sensitive messages
+            },
+            {
+                "url": "https://sqs.us-west-2.amazonaws.com/123456789012/medium-priority-queue",
+                "name": "medium-priority",
+                "priority": 2,
+                "weight": 0.8,
+                "maxBatchSize": 10,
+                "pollInterval": "2s" // Balance between cost and latency
+            },
+            {
+                "url": "https://sqs.us-west-2.amazonaws.com/123456789012/low-priority-queue",
+                "name": "low-priority",
+                "priority": 1,
+                "weight": 0.6,
+                "maxBatchSize": 10,
+                "pollInterval": "5s" // Cost-efficient for non-urgent messages
+            }
+        ]
+    },
+    "metrics": {
+        "namespace": "MyApp/SQSConsumer",
+        "region": "us-west-2",
+        "publishInterval": "1m",
+        "retentionPeriod": "1h",
+        "maxDataPoints": 1000
+    },
+    "buffer": {
+        "initialSize": 1000,
+        "maxSize": 5000,
+        "highPriorityPercent": 0.5,
+        "mediumPriorityPercent": 0.3,
+        "lowPriorityPercent": 0.2,
+        "scaleUpThreshold": 0.8,
+        "scaleDownThreshold": 0.3,
+        "maxMessageSize": 262144,
+        "memoryLimit": 536870912,
+        "scaleIncrement": 1.2,
+        "maxOverflowCount": 100
+    },
+    "processor": {
+        "maxConcurrency": 100,
+        "minConcurrency": 10,
+        "processTimeout": "30s",
+        "scaleUpThreshold": 0.7,
+        "scaleDownThreshold": 0.3,
+        "scaleInterval": "5s"
+    }
+  }

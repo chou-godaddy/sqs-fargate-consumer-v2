@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy the IAM Custom Role Service Catalog Product.
+Parameters:
+  RoleNameSuffix:
+    Type: String
+    Description: Name of custom Role appended to TeamName-custom-
+  AssumingServices:
+    Type: String
+    Description: Comma delimited list of Services that needs to assume the role (but marked as String)
+  DevelopmentTeam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM Parameter for team owning the created resources.
+    Default: /AdminParams/Team/Name
+    AllowedValues:
+      - /AdminParams/Team/Name
+Resources:
+  IAMRole:
+    Type: AWS::ServiceCatalog::CloudFormationProvisionedProduct
+    Properties:
+      ProductName: IAMRole
+      ProvisioningArtifactName: 1.0.10
+      ProvisionedProductName: !Sub ${RoleNameSuffix}-FargateTaskRole
+      ProvisioningParameters:
+        - Key: AssumingServices
+          Value: !Ref AssumingServices
+        - Key: RoleNameSuffix
+          Value: !Sub ${RoleNameSuffix}-FargateTaskRole
+        - Key: ManagedPolicyArns
+          Value: !Join [ ",", [ !Sub "arn:aws:iam::${AWS::AccountId}:policy/GD-AWS-KMS-USER", !Sub "arn:aws:iam::${AWS::AccountId}:policy/AllowResourcesAccessToCloudWatchPolicy", !Sub "arn:aws:iam::${AWS::AccountId}:policy/${DevelopmentTeam}-custom-${RoleNameSuffix}-FargateTaskRolePolicy"]]
+      Tags:
+        - Key: doNotShutDown
+          Value: "true"
+    DependsOn:
+      - IAMPolicy
+  IAMPolicy:
+    Type: AWS::ServiceCatalog::CloudFormationProvisionedProduct
+    Properties:
+      ProductName: IAMPolicy
+      ProvisioningArtifactName: 1.0.0
+      ProvisionedProductName: !Sub ${RoleNameSuffix}-FargateTaskRolePolicy
+      ProvisioningParameters:
+        - Key: PolicyNameSuffix
+          Value: !Sub ${RoleNameSuffix}-FargateTaskRolePolicy
+        - Key: PolicyJSON
+          Value: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sts:AssumeRole"
+                  ],
+                  "Resource": "arn:aws:iam::${AWS::AccountId}:role/*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:*",
+                    "cloudwatch:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssm:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "execute-api:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sns:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:*"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+      Tags:
+        - Key: doNotShutDown
+          Value: "true"

@@ -209,7 +209,7 @@ func (eb *EventBuffer) shouldScale() bool {
 		return true
 	}
 
-	metrics := eb.getMetrics()
+	metrics := eb.GetMetrics()
 	avgUtilization := (metrics.HighPriorityUtilization +
 		metrics.MediumPriorityUtilization +
 		metrics.LowPriorityUtilization) / 3
@@ -269,7 +269,7 @@ func (eb *EventBuffer) transferMessages(old, new chan *Event) {
 }
 
 func (eb *EventBuffer) recordMetrics() {
-	metrics := eb.getMetrics()
+	metrics := eb.GetMetrics()
 
 	eb.metricsMu.Lock()
 	defer eb.metricsMu.Unlock()
@@ -300,7 +300,7 @@ func (eb *EventBuffer) recordMetrics() {
 	}
 }
 
-func (eb *EventBuffer) getMetrics() BufferMetrics {
+func (eb *EventBuffer) GetMetrics() BufferMetrics {
 	highLen := len(eb.highPriority)
 	medLen := len(eb.mediumPriority)
 	lowLen := len(eb.lowPriority)

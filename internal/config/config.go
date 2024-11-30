@@ -3,6 +3,9 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	goapi "github.com/gdcorp-domains/fulfillment-go-api"
+	registrarconfig "github.com/gdcorp-domains/fulfillment-registrar-config"
+	rgclient "github.com/gdcorp-domains/fulfillment-rg-client"
 	"os"
 	"time"
 )
@@ -45,13 +48,14 @@ type ConsumerGroupConfig struct {
 	MaxWorkers         int           `json:"maxWorkers"`
 	MinWorkers         int           `json:"minWorkers"`
 	BufferSize         int           `json:"bufferSize"`
-	ScaleUpThreshold   float64       `json:"scaleUpThreshold"`   // Percentage (0-100)
-	ScaleDownThreshold float64       `json:"scaleDownThreshold"` // Percentage (0-100)
+	ScaleUpThreshold   float64       `json:"scaleUpThreshold"`   // Percentage (0-1)
+	ScaleDownThreshold float64       `json:"scaleDownThreshold"` // Percentage (0-1)
 	MetricsWindow      Duration      `json:"metricsWindow"`
-	ScalingInterval    Duration      `json:"scalingInterval"`
 	Queues             []QueueConfig `json:"queues"`
 	ScaleUpCooldown    Duration      `json:"scaleUpCooldown"`   // Minimum time between scale ups
 	ScaleDownCooldown  Duration      `json:"scaleDownCooldown"` // Minimum time between scale downs
+	ScalingUpTicker    Duration      `json:"scalingUpTicker"`
+	ScalingDownTicker  Duration      `json:"scalingDownTicker"`
 }
 
 type MetricsConfig struct {
@@ -76,21 +80,44 @@ type BufferConfig struct {
 	MaxOverflowCount      int64   `json:"maxOverflowCount"`      // Maximum number of overflows before scaling
 }
 
+type ProcessorConfig struct {
+	MaxConcurrency     int           // Maximum number of concurrent message processors
+	MinConcurrency     int           // Minimum number of concurrent processors to maintain
+	ProcessTimeout     time.Duration // Maximum time to process a single message
+	ScaleUpThreshold   float64       // Buffer utilization threshold to scale up processors (0-1)
+	ScaleDownThreshold float64       // Buffer utilization threshold to scale down processors (0-1)
+	ScaleInterval      time.Duration // How often to check scaling
+}
+
 type Config struct {
-	ConsumerGroup ConsumerGroupConfig `json:"consumer"`
-	Metrics       MetricsConfig       `json:"metrics"`
-	Buffer        BufferConfig        `json:"buffer"`
+	goapi.Config
+	ActionAPIURL               string                 `json:"actionApiUrl"`
+	RegistryContactsURL        string                 `json:"registryContactsUrl"`
+	RegistryDomainsURL         string                 `json:"registryDomainsUrl"`
+	RegistrarConfig            registrarconfig.Config `json:"registrarConfig"`
+	SwitchBoardApplicationName string                 `json:"switchBoardApplicationName"`
+	SQLDATAAPIURL              string                 `json:"sqldataAPIURL"`
+	DBName                     string                 `json:"database"`
+	ShopperAPIURL              string                 `json:"shopperApiUrl"`
+	IntlContactsAPIURL         string                 `json:"internationalContactsApiUrl"`
+	SwitchboardAPIURL          string                 `json:"switchboardApiUrl"`
+	RegistryConfig             rgclient.Config        `json:"registryConfig"`
+	MSMQURL                    string                 `json:"genericQueueEndpointUrl"`
+	ConsumerGroupConfig        ConsumerGroupConfig    `json:"consumer"`
+	MetricsConfig              MetricsConfig          `json:"metrics"`
+	BufferConfig               BufferConfig           `json:"buffer"`
+	ProcessorConfig            ProcessorConfig        `json:"processor"`
 }
 
 // Validate performs validation of the configuration
 func (c *Config) Validate() error {
-	if c.ConsumerGroup.MinWorkers <= 0 {
+	if c.ConsumerGroupConfig.MinWorkers <= 0 {
 		return fmt.Errorf("minimum workers must be greater than 0")
 	}
-	if c.ConsumerGroup.MaxWorkers < c.ConsumerGroup.MinWorkers {
+	if c.ConsumerGroupConfig.MaxWorkers < c.ConsumerGroupConfig.MinWorkers {
 		return fmt.Errorf("maximum workers must be greater than or equal to minimum workers")
 	}
-	if c.Buffer.HighPriorityPercent+c.Buffer.MediumPriorityPercent+c.Buffer.LowPriorityPercent != 1.0 {
+	if c.BufferConfig.HighPriorityPercent+c.BufferConfig.MediumPriorityPercent+c.BufferConfig.LowPriorityPercent != 1.0 {
 		return fmt.Errorf("buffer priority percentages must sum to 1.0")
 	}
 	return nil

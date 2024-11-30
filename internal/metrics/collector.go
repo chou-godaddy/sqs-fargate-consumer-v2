@@ -6,10 +6,11 @@ import (
 	"sync"
 	"time"
 
+	"sqs-fargate-consumer-v2/internal/config"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
-	"sqs-fargate-consumer-v2/internal/config"
 )
 
 type MetricType string
@@ -53,6 +54,7 @@ type Collector struct {
 	config  *config.MetricsConfig
 	metrics map[string]map[MetricType]*MetricSeries
 	mu      sync.RWMutex
+	done    chan struct{}
 
 	// Metric metadata
 	metricUnits map[MetricType]MetricUnit
@@ -101,6 +103,7 @@ func NewCollector(client *cloudwatch.Client, config *config.MetricsConfig) *Coll
 		config:      config,
 		metrics:     make(map[string]map[MetricType]*MetricSeries),
 		metricUnits: units,
+		done:        make(chan struct{}),
 	}
 }
 
@@ -108,22 +111,28 @@ func (c *Collector) Start(ctx context.Context) error {
 	// Start metrics cleanup routine
 	go c.cleanupRoutine(ctx)
 
-	// Start metrics publishing routine
-	publishTicker := time.NewTicker(c.config.PublishInterval.Duration)
-	defer publishTicker.Stop()
+	go func() {
+		// Start metrics publishing routine
+		publishTicker := time.NewTicker(c.config.PublishInterval.Duration)
+		defer publishTicker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-publishTicker.C:
-			if err := c.publish(ctx); err != nil {
-				// Log error but continue collecting
-				fmt.Printf("Error publishing metrics: %v\n", err)
-				continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.done:
+				return
+			case <-publishTicker.C:
+				if err := c.publish(ctx); err != nil {
+					// Log error but continue collecting
+					fmt.Printf("Error publishing metrics: %v\n", err)
+					continue
+				}
 			}
 		}
-	}
+	}()
+
+	return nil
 }
 
 func (c *Collector) cleanupRoutine(ctx context.Context) {
@@ -133,6 +142,8 @@ func (c *Collector) cleanupRoutine(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-c.done:
 			return
 		case <-cleanupTicker.C:
 			c.cleanup()
@@ -396,4 +407,8 @@ func (c *Collector) GetBufferMetrics() *BufferMetrics {
 	}
 
 	return result
+}
+
+func (c *Collector) Shutdown(ctx context.Context) {
+	close(c.done)
 }

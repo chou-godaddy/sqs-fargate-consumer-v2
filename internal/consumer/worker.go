@@ -121,7 +121,7 @@ func (w *Worker) Start(ctx context.Context) error {
 }
 
 func (w *Worker) shouldPoll() bool {
-	metrics := w.buffer.getMetrics()
+	metrics := w.buffer.GetMetrics()
 
 	// Don't poll if buffer utilization is too high
 	if metrics.HighPriorityUtilization > 0.9 ||
@@ -139,7 +139,7 @@ func (w *Worker) shouldPoll() bool {
 }
 
 func (w *Worker) calculateMaxMessages() int32 {
-	metrics := w.buffer.getMetrics()
+	metrics := w.buffer.GetMetrics()
 
 	// Calculate available capacity in each priority level
 	highCapacity := cap(w.buffer.highPriority) - len(w.buffer.highPriority)
