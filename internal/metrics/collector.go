@@ -155,11 +155,26 @@ func (c *Collector) cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.metrics == nil {
+		c.metrics = make(map[string]map[MetricType]*MetricSeries)
+		return
+	}
+
 	now := time.Now()
 	retentionCutoff := now.Add(-c.config.RetentionPeriod.Duration)
 
-	for queueURL, metrics := range c.metrics {
+	for queueName, metrics := range c.metrics {
+		if metrics == nil {
+			delete(c.metrics, queueName)
+			continue
+		}
+
 		for metricType, series := range metrics {
+			if series == nil || series.Points == nil {
+				delete(metrics, metricType)
+				continue
+			}
+
 			// Remove old data points
 			i := 0
 			for ; i < len(series.Points); i++ {
@@ -174,6 +189,7 @@ func (c *Collector) cleanup() {
 			// Remove metrics that haven't been updated recently
 			if series.LastWrite.Before(retentionCutoff) {
 				delete(metrics, metricType)
+				continue
 			}
 
 			// Enforce maximum number of data points
@@ -185,26 +201,36 @@ func (c *Collector) cleanup() {
 
 		// Remove empty queue metrics
 		if len(metrics) == 0 {
-			delete(c.metrics, queueURL)
+			delete(c.metrics, queueName)
 		}
 	}
 }
 
-func (c *Collector) RecordMetric(queueURL string, metricType MetricType, value float64) {
+func (c *Collector) RecordMetric(queueName string, metricType MetricType, value float64) {
+	if c == nil || c.metrics == nil {
+		return // Skip if collector is nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.metrics[queueURL]; !exists {
-		c.metrics[queueURL] = make(map[MetricType]*MetricSeries)
+	// Validate metric type
+	if _, exists := c.metricUnits[metricType]; !exists {
+		return // Skip invalid metric types
 	}
 
-	if _, exists := c.metrics[queueURL][metricType]; !exists {
-		c.metrics[queueURL][metricType] = &MetricSeries{
+	normalizedName := c.normalizeQueueName(queueName)
+	if _, exists := c.metrics[normalizedName]; !exists {
+		c.metrics[normalizedName] = make(map[MetricType]*MetricSeries)
+	}
+
+	if _, exists := c.metrics[normalizedName][metricType]; !exists {
+		c.metrics[normalizedName][metricType] = &MetricSeries{
 			Points: make([]MetricDataPoint, 0, c.config.MaxDataPoints),
 		}
 	}
 
-	series := c.metrics[queueURL][metricType]
+	series := c.metrics[normalizedName][metricType]
 	series.Points = append(series.Points, MetricDataPoint{
 		Value:     value,
 		Timestamp: time.Now(),
@@ -218,42 +244,47 @@ func (c *Collector) RecordMetric(queueURL string, metricType MetricType, value f
 	}
 }
 
-func (c *Collector) RecordProcessingStarted(queueURL string, priority int) {
-	c.RecordMetric(queueURL, MetricMessagesReceived, 1)
+func (c *Collector) RecordProcessingStarted(queueName string, priority int) {
+	c.RecordMetric(queueName, MetricMessagesReceived, 1)
 }
 
-func (c *Collector) RecordProcessingComplete(queueURL string, priority int, duration time.Duration) {
-	c.RecordMetric(queueURL, MetricMessagesProcessed, 1)
-	c.RecordMetric(queueURL, MetricProcessingTime, float64(duration.Milliseconds()))
+func (c *Collector) RecordProcessingComplete(queueName string, priority int, duration time.Duration) {
+	c.RecordMetric(queueName, MetricMessagesProcessed, 1)
+	c.RecordMetric(queueName, MetricProcessingTime, float64(duration.Milliseconds()))
 }
 
-func (c *Collector) RecordError(queueURL string, errorType string) {
-	c.RecordMetric(queueURL, MetricProcessingErrors, 1)
+func (c *Collector) RecordError(queueName string, errorType string) {
+	c.RecordMetric(queueName, MetricProcessingErrors, 1)
 }
 
 func (c *Collector) RecordWorkerAdded(workerID string) {
-	c.RecordMetric("", MetricWorkerAdditions, 1)
-	c.RecordMetric("", MetricWorkerCount, float64(c.getWorkerCount()+1))
+	normalizedName := c.normalizeQueueName("")
+	c.RecordMetric(normalizedName, MetricWorkerAdditions, 1)
+	c.RecordMetric(normalizedName, MetricWorkerCount, float64(c.getWorkerCount()+1))
 }
 
 func (c *Collector) RecordWorkerRemoved(workerID string) {
-	c.RecordMetric("", MetricWorkerRemovals, 1)
-	c.RecordMetric("", MetricWorkerCount, float64(c.getWorkerCount()-1))
+	normalizedName := c.normalizeQueueName("")
+	c.RecordMetric(normalizedName, MetricWorkerRemovals, 1)
+	c.RecordMetric(normalizedName, MetricWorkerCount, float64(c.getWorkerCount()-1))
 }
 
 func (c *Collector) RecordWorkerReplaced(workerID string) {
-	// Worker count stays the same for replacement
-	c.RecordMetric("", MetricWorkerRemovals, 1)
-	c.RecordMetric("", MetricWorkerAdditions, 1)
+	normalizedName := c.normalizeQueueName("")
+	c.RecordMetric(normalizedName, MetricWorkerRemovals, 1)
+	c.RecordMetric(normalizedName, MetricWorkerAdditions, 1)
 }
 
 func (c *Collector) publish(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	var metricData []types.MetricDatum
 
-	for queueURL, metrics := range c.metrics {
+	for queueName, metrics := range c.metrics {
 		for metricType, series := range metrics {
 			if len(series.Points) == 0 {
 				continue
@@ -269,8 +300,8 @@ func (c *Collector) publish(ctx context.Context) error {
 				Unit:       types.StandardUnit(point.Unit),
 				Dimensions: []types.Dimension{
 					{
-						Name:  aws.String("QueueURL"),
-						Value: aws.String(queueURL),
+						Name:  aws.String("QueueName"),
+						Value: aws.String(queueName),
 					},
 				},
 			}
@@ -299,26 +330,33 @@ func (c *Collector) publish(ctx context.Context) error {
 	return nil
 }
 
-func (c *Collector) GetRawMetrics(queueURL string) map[MetricType]float64 {
+func (c *Collector) GetRawMetrics(queueName string) map[MetricType]float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	// Use normalized queue name
+	normalizedName := c.normalizeQueueName(queueName)
 	result := make(map[MetricType]float64)
-	if queueMetrics, exists := c.metrics[queueURL]; exists {
+	if queueMetrics, exists := c.metrics[normalizedName]; exists {
 		for metricType, series := range queueMetrics {
-			if len(series.Points) > 0 {
-				result[metricType] = series.Points[len(series.Points)-1].Value
+			// Create a copy of points under lock
+			points := make([]MetricDataPoint, len(series.Points))
+			copy(points, series.Points)
+
+			if len(points) > 0 {
+				result[metricType] = points[len(points)-1].Value
 			}
 		}
 	}
 	return result
 }
 
-func (c *Collector) GetQueueMetrics(queueURL string) *QueueMetrics {
+func (c *Collector) GetQueueMetrics(queueName string) *QueueMetrics {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if queueMetrics, exists := c.metrics[queueURL]; exists {
+	normalizedName := c.normalizeQueueName(queueName)
+	if queueMetrics, exists := c.metrics[normalizedName]; exists {
 		qm := &QueueMetrics{}
 
 		// Get MessageCount
@@ -352,9 +390,14 @@ func (c *Collector) GetQueueMetrics(queueURL string) *QueueMetrics {
 }
 
 func (c *Collector) getWorkerCount() int {
-	metrics := c.GetRawMetrics("") // Use GetRawMetrics instead of GetQueueMetrics
-	if count, exists := metrics[MetricWorkerCount]; exists {
-		return int(count)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	normalizedName := c.normalizeQueueName("")
+	if metrics, exists := c.metrics[normalizedName]; exists {
+		if workerCount, exists := metrics[MetricWorkerCount]; exists && len(workerCount.Points) > 0 {
+			return int(workerCount.Points[len(workerCount.Points)-1].Value)
+		}
 	}
 	return 0
 }
@@ -365,9 +408,9 @@ func (c *Collector) GetAllQueueMetrics() map[string]*QueueMetrics {
 	defer c.mu.RUnlock()
 
 	result := make(map[string]*QueueMetrics)
-	for queueURL := range c.metrics {
-		if metrics := c.GetQueueMetrics(queueURL); metrics != nil {
-			result[queueURL] = metrics
+	for queueName := range c.metrics {
+		if metrics := c.GetQueueMetrics(queueName); metrics != nil {
+			result[queueName] = metrics
 		}
 	}
 	return result
@@ -377,7 +420,8 @@ func (c *Collector) GetWorkerCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if metrics, exists := c.metrics[""]; exists {
+	normalizedName := c.normalizeQueueName("")
+	if metrics, exists := c.metrics[normalizedName]; exists {
 		if workerCount, exists := metrics[MetricWorkerCount]; exists && len(workerCount.Points) > 0 {
 			return int(workerCount.Points[len(workerCount.Points)-1].Value)
 		}
@@ -386,29 +430,47 @@ func (c *Collector) GetWorkerCount() int {
 }
 
 func (c *Collector) GetBufferMetrics() *BufferMetrics {
-	rawMetrics := c.GetRawMetrics("") // Use empty string for global metrics
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
+	normalizedName := c.normalizeQueueName("")
 	result := &BufferMetrics{}
 
-	// Get utilization metrics
-	if high, exists := rawMetrics[MetricBufferUtilization+"High"]; exists {
-		result.HighPriorityUtilization = high
-	}
-	if med, exists := rawMetrics[MetricBufferUtilization+"Medium"]; exists {
-		result.MediumPriorityUtilization = med
-	}
-	if low, exists := rawMetrics[MetricBufferUtilization+"Low"]; exists {
-		result.LowPriorityUtilization = low
-	}
-
-	// Get memory usage
-	if memory, exists := rawMetrics[MetricMemoryUsage]; exists {
-		result.TotalMemoryUsage = int64(memory)
+	if metrics, exists := c.metrics[normalizedName]; exists {
+		// Get utilization metrics directly under lock
+		if high, exists := metrics[MetricBufferUtilization+"High"]; exists && len(high.Points) > 0 {
+			result.HighPriorityUtilization = high.Points[len(high.Points)-1].Value
+		}
+		if med, exists := metrics[MetricBufferUtilization+"Medium"]; exists && len(med.Points) > 0 {
+			result.MediumPriorityUtilization = med.Points[len(med.Points)-1].Value
+		}
+		if low, exists := metrics[MetricBufferUtilization+"Low"]; exists && len(low.Points) > 0 {
+			result.LowPriorityUtilization = low.Points[len(low.Points)-1].Value
+		}
+		if memory, exists := metrics[MetricMemoryUsage]; exists && len(memory.Points) > 0 {
+			result.TotalMemoryUsage = int64(memory.Points[len(memory.Points)-1].Value)
+		}
 	}
 
 	return result
 }
 
-func (c *Collector) Shutdown(ctx context.Context) {
-	close(c.done)
+func (c *Collector) Shutdown(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		// Already shutting down
+		return nil
+	default:
+		close(c.done)
+		return nil
+	}
+}
+
+func (c *Collector) normalizeQueueName(queueName string) string {
+	if queueName == "" {
+		return "default"
+	}
+	return queueName
 }

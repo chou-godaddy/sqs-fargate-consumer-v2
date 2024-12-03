@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/metrics"
@@ -78,6 +79,7 @@ func (c *ConsumerGroup) Start(ctx context.Context) error {
 	}
 
 	c.startupDone.Store(true)
+	log.Printf("Consumer group started with %d workers\n", c.config.MinWorkers)
 
 	// Start monitoring routines
 	go c.monitorWorkerStatus(ctx)
@@ -147,6 +149,7 @@ func (c *ConsumerGroup) AddWorker() error {
 				// During startup, propagate error to main thread
 				panic(fmt.Sprintf("worker startup failed: %v", err))
 			}
+			log.Printf("Worker %s failed to start with an error: %v\n", workerID, err)
 			c.handleWorkerError(workerID, err)
 		}
 	}()

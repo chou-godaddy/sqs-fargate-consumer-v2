@@ -3,6 +3,8 @@ package processor
 import (
 	"context"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"log"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/consumer"
 	"sqs-fargate-consumer-v2/internal/metrics"
@@ -17,6 +19,7 @@ type MessageProcessor struct {
 	buffer    *consumer.EventBuffer
 	handler   MessageHandler
 	collector *metrics.Collector
+	client    *sqs.Client
 
 	// Worker pool management
 	workers    chan struct{} // Semaphore for controlling concurrency
@@ -32,12 +35,13 @@ type MessageProcessor struct {
 	mu             sync.RWMutex
 }
 
-func NewMessageProcessor(config config.ProcessorConfig, buffer *consumer.EventBuffer, handler MessageHandler, collector *metrics.Collector) *MessageProcessor {
+func NewMessageProcessor(config config.ProcessorConfig, buffer *consumer.EventBuffer, handler MessageHandler, collector *metrics.Collector, client *sqs.Client) *MessageProcessor {
 	return &MessageProcessor{
 		config:         config,
 		buffer:         buffer,
 		handler:        handler,
 		collector:      collector,
+		client:         client,
 		workers:        make(chan struct{}, config.MaxConcurrency),
 		shutdownSignal: make(chan struct{}),
 	}
@@ -48,6 +52,8 @@ func (p *MessageProcessor) Start(ctx context.Context) error {
 	for i := 0; i < p.config.MinConcurrency; i++ {
 		p.workers <- struct{}{}
 	}
+
+	log.Printf("Starting message processor with %d concurrency", p.config.MinConcurrency)
 
 	// Start scaling goroutine
 	go p.monitorAndScale(ctx)
@@ -71,6 +77,7 @@ func (p *MessageProcessor) processLoop(ctx context.Context) {
 			case worker := <-p.workers:
 				// Got a worker, try to get a message
 				if event, err := p.buffer.Pop(ctx); err == nil && event != nil {
+					log.Printf("Processing message: %s\n", *event.Message.MessageId)
 					p.processing.Add(1)
 					go func() {
 						defer p.processing.Done()
@@ -79,6 +86,7 @@ func (p *MessageProcessor) processLoop(ctx context.Context) {
 						p.processMessage(ctx, event)
 					}()
 				} else {
+					log.Printf("Error popping message: %v\n", err)
 					// No message available, return worker immediately
 					p.workers <- worker
 					time.Sleep(10 * time.Millisecond) // Prevent tight loop
@@ -95,7 +103,7 @@ func (p *MessageProcessor) processMessage(ctx context.Context, event *consumer.E
 	startTime := time.Now()
 
 	// Create timeout context for message processing
-	msgCtx, cancel := context.WithTimeout(ctx, p.config.ProcessTimeout)
+	msgCtx, cancel := context.WithTimeout(ctx, p.config.ProcessTimeout.Duration)
 	defer cancel()
 
 	// Process the message
@@ -104,15 +112,37 @@ func (p *MessageProcessor) processMessage(ctx context.Context, event *consumer.E
 	duration := time.Since(startTime)
 
 	if err != nil {
-		p.collector.RecordError(event.QueueURL, "process_error")
+		p.collector.RecordError(event.QueueName, "process_error")
 		fmt.Printf("Error processing message: %v\n", err)
 	} else {
-		p.collector.RecordProcessingComplete(event.QueueURL, int(event.Priority), duration)
+		if err := p.deleteMessage(msgCtx, event); err != nil {
+			log.Printf("Processor failed to delete message %s: %v\n", *event.Message.MessageId, err)
+		} else {
+			log.Printf("Processor successfully processed and deleted message %s\n", *event.Message.MessageId)
+			p.collector.RecordProcessingComplete(event.QueueName, int(event.Priority), duration)
+		}
 	}
 }
 
+func (p *MessageProcessor) deleteMessage(ctx context.Context, event *consumer.Event) error {
+	log.Printf("Deleting message: %s from queue: %s\n", *event.Message.MessageId, event.QueueURL)
+
+	input := &sqs.DeleteMessageInput{
+		QueueUrl:      &event.QueueURL,
+		ReceiptHandle: event.Message.ReceiptHandle,
+	}
+
+	if _, err := p.client.DeleteMessage(ctx, input); err != nil {
+		p.collector.RecordError(event.QueueName, "delete_error")
+		log.Printf("Error deleting message: %v\n", err)
+		return fmt.Errorf("failed to delete message: %v", err)
+	}
+
+	return nil
+}
+
 func (p *MessageProcessor) monitorAndScale(ctx context.Context) {
-	ticker := time.NewTicker(p.config.ScaleInterval)
+	ticker := time.NewTicker(p.config.ScaleInterval.Duration)
 	defer ticker.Stop()
 
 	for {
@@ -145,12 +175,14 @@ func (p *MessageProcessor) adjustConcurrency() {
 		if currentWorkers < p.config.MaxConcurrency {
 			newSize := min(currentWorkers+5, p.config.MaxConcurrency)
 			p.resizeWorkerPool(newSize)
+			log.Printf("Scaling up to %d concurrent processors\n", newSize)
 		}
 	} else if avgUtilization < p.config.ScaleDownThreshold {
 		// Scale down workers if above min
 		if currentWorkers > p.config.MinConcurrency {
 			newSize := max(currentWorkers-1, p.config.MinConcurrency)
 			p.resizeWorkerPool(newSize)
+			log.Printf("Scaling down to %d concurrent processors\n", newSize)
 		}
 	}
 }

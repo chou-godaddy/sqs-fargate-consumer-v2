@@ -2,7 +2,7 @@ template_path: sqs.yaml
 stack_name: sqs-fargate-consumer-v2-medium-priority
 parameters:
   ScProductVersion: 1.0.9
-  QueueName: "sqs-fargate-consumer-v2-medium-priority"
+  QueueName: "sqs-fargate-consumer-v2-medium"
   VisibilityTimeout: "300"
   MaxReceiveCount: "10"
   # DeadLetterTargetArn: !stack_output_external sqs-fargate-consumer-v2-medium-priority-dlq::QueueArn

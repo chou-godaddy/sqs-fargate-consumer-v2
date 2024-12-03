@@ -48,10 +48,10 @@ func NewScheduler(queues []config.QueueConfig, collector *metrics.Collector) *Sc
 	}
 }
 
-func (s *Scheduler) UpdateMetrics(queueURL string, metrics *QueueMetrics) {
+func (s *Scheduler) UpdateMetrics(queueName string, metrics *QueueMetrics) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.metrics[queueURL] = metrics
+	s.metrics[queueName] = metrics
 }
 
 func (s *Scheduler) SelectQueue() (*config.QueueConfig, error) {
@@ -64,15 +64,21 @@ func (s *Scheduler) SelectQueue() (*config.QueueConfig, error) {
 	now := time.Now()
 
 	for _, queue := range s.queues {
-		metrics, exists := s.metrics[queue.URL]
-		if !exists {
+		metrics, exists := s.metrics[queue.Name]
+		if metrics == nil || !exists {
+			// Fallback to basic priority-based selection for new/unknown queues
+			score := s.priorityWeights[queue.Priority] * queue.Weight
+			if score > highestScore {
+				highestScore = score
+				selectedQueue = &queue
+			}
 			continue
 		}
 
 		// Skip if queue was just polled (considering poll interval)
-		if timeSinceLastPoll := now.Sub(metrics.LastPollTime); timeSinceLastPoll < queue.PollInterval.Duration {
-			continue
-		}
+		// if timeSinceLastPoll := now.Sub(metrics.LastPollTime); timeSinceLastPoll < queue.PollInterval.Duration {
+		// 	continue
+		// }
 
 		// Calculate base priority score (exponential scaling)
 		priorityScore := s.priorityWeights[queue.Priority]
@@ -92,7 +98,7 @@ func (s *Scheduler) SelectQueue() (*config.QueueConfig, error) {
 
 		// Starvation prevention - boost score if queue hasn't been selected recently
 		starvationBoost := 1.0
-		if consecutive, exists := s.consecutiveSelects[queue.URL]; !exists || consecutive == 0 {
+		if consecutive, exists := s.consecutiveSelects[queue.Name]; !exists || consecutive == 0 {
 			starvationBoost = 1.2
 		}
 
@@ -100,7 +106,7 @@ func (s *Scheduler) SelectQueue() (*config.QueueConfig, error) {
 		score := priorityScore * backlogFactor * timeFactor * errorPenalty * starvationBoost * queue.Weight
 
 		// Apply fairness adjustment if this queue has been selected too many times consecutively
-		if consecutive := s.consecutiveSelects[queue.URL]; consecutive > 3 {
+		if consecutive := s.consecutiveSelects[queue.Name]; consecutive > 3 {
 			score *= math.Pow(0.8, float64(consecutive-3)) // Decay score for repeated selection
 		}
 
@@ -115,15 +121,15 @@ func (s *Scheduler) SelectQueue() (*config.QueueConfig, error) {
 	}
 
 	// Update consecutive selection tracking
-	for url := range s.consecutiveSelects {
-		if url == selectedQueue.URL {
-			s.consecutiveSelects[url]++
+	for queueName := range s.consecutiveSelects {
+		if queueName == selectedQueue.Name {
+			s.consecutiveSelects[queueName]++
 		} else {
-			s.consecutiveSelects[url] = 0
+			s.consecutiveSelects[queueName] = 0
 		}
 	}
 
-	s.lastSelectedQueue = selectedQueue.URL
+	s.lastSelectedQueue = selectedQueue.Name
 	return selectedQueue, nil
 }
 
@@ -146,9 +152,9 @@ func (s *Scheduler) updateQueueMetrics() {
 	defer s.mu.Unlock()
 
 	for _, queue := range s.queues {
-		queueMetrics := s.collector.GetQueueMetrics(queue.URL)
+		queueMetrics := s.collector.GetQueueMetrics(queue.Name)
 		if queueMetrics != nil {
-			s.metrics[queue.URL] = &QueueMetrics{
+			s.metrics[queue.Name] = &QueueMetrics{
 				MessageCount:   queueMetrics.MessageCount,
 				InFlightCount:  queueMetrics.InFlightCount,
 				ProcessingTime: queueMetrics.ProcessingTime,

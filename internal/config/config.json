@@ -113,44 +113,37 @@
         "maxWorkers": 100,
         "minWorkers": 5,
         "bufferSize": 1000,
-        "scaleUpThreshold": 0.7,
-        "scaleDownThreshold": 0.3,
-        "metricsWindow": "1m",
-        "scaleUpCooldown": "5s",
-        "scaleDownCooldown": "1m",
-        "scalingUpTicker": "5s",
-        "scalingDownTicker": "30s",
         "queues": [
             {
-                "url": "https://sqs.us-west-2.amazonaws.com/123456789012/high-priority-queue",
+                "url": "https://sqs.us-west-2.amazonaws.com/982600293865/sqs-fargate-consumer-v2-high",
                 "name": "high-priority",
                 "priority": 3,
                 "weight": 1.0,
                 "maxBatchSize": 10,
-                "pollInterval": "1s" // Time-sensitive messages
+                "pollInterval": "1s" 
             },
             {
-                "url": "https://sqs.us-west-2.amazonaws.com/123456789012/medium-priority-queue",
+                "url": "https://sqs.us-west-2.amazonaws.com/982600293865/sqs-fargate-consumer-v2-medium",
                 "name": "medium-priority",
                 "priority": 2,
                 "weight": 0.8,
                 "maxBatchSize": 10,
-                "pollInterval": "2s" // Balance between cost and latency
+                "pollInterval": "2s" 
             },
             {
-                "url": "https://sqs.us-west-2.amazonaws.com/123456789012/low-priority-queue",
+                "url": "https://sqs.us-west-2.amazonaws.com/982600293865/sqs-fargate-consumer-v2-low",
                 "name": "low-priority",
                 "priority": 1,
                 "weight": 0.6,
                 "maxBatchSize": 10,
-                "pollInterval": "5s" // Cost-efficient for non-urgent messages
+                "pollInterval": "5s" 
             }
         ]
     },
     "metrics": {
-        "namespace": "MyApp/SQSConsumer",
+        "namespace": "SQS-FARGATE-CONSUMER-V2/SQSConsumer",
         "region": "us-west-2",
-        "publishInterval": "1m",
+        "publishInterval": "30s",
         "retentionPeriod": "1h",
         "maxDataPoints": 1000
     },
@@ -162,17 +155,26 @@
         "lowPriorityPercent": 0.2,
         "scaleUpThreshold": 0.8,
         "scaleDownThreshold": 0.3,
-        "maxMessageSize": 262144,
-        "memoryLimit": 536870912,
+        "maxMessageSize": 262144, 
+        "memoryLimit": 536870912, 
         "scaleIncrement": 1.2,
         "maxOverflowCount": 100
     },
     "processor": {
         "maxConcurrency": 100,
         "minConcurrency": 10,
-        "processTimeout": "30s",
+        "processTimeout": "30s", 
         "scaleUpThreshold": 0.7,
         "scaleDownThreshold": 0.3,
         "scaleInterval": "5s"
+    },
+    "scaler": {
+      "metricsWindow": "5m",
+      "scaleUpThreshold": 0.7,
+      "scaleDownThreshold": 0.3,
+      "scaleUpCooldown": "5s",
+      "scaleDownCooldown": "1m",
+      "scalingUpTicker": "5s", 
+      "scalingDownTicker": "30s"
     }
   }

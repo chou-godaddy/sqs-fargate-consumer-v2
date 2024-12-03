@@ -3,6 +3,7 @@ package scaler
 import (
 	"context"
 	"fmt"
+	"log"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sync"
@@ -23,11 +24,10 @@ type ScalerMetrics struct {
 }
 
 type Scaler struct {
-	consumer           ConsumerController
-	collector          *metrics.Collector
-	config             *config.ConsumerGroupConfig
-	scaleUpThreshold   float64
-	scaleDownThreshold float64
+	consumer       ConsumerController
+	collector      *metrics.Collector
+	config         *config.ScalerConfig
+	consumerConfig *config.ConsumerGroupConfig
 
 	lastScaleUp   time.Time
 	lastScaleDown time.Time
@@ -48,19 +48,19 @@ type Scaler struct {
 func NewScaler(
 	consumer ConsumerController,
 	collector *metrics.Collector,
-	config *config.ConsumerGroupConfig,
+	config *config.ScalerConfig,
+	consumerConfig *config.ConsumerGroupConfig,
 ) *Scaler {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Scaler{
-		consumer:           consumer,
-		collector:          collector,
-		config:             config,
-		scaleUpThreshold:   config.ScaleUpThreshold,
-		scaleDownThreshold: config.ScaleDownThreshold,
-		metricsWindow:      make([]ScalerMetrics, 0, 100),
-		ctx:                ctx,
-		cancel:             cancel,
+		consumer:       consumer,
+		collector:      collector,
+		config:         config,
+		consumerConfig: consumerConfig,
+		metricsWindow:  make([]ScalerMetrics, 0, 100),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 }
 
@@ -69,6 +69,8 @@ func (s *Scaler) Start(ctx context.Context) error {
 	fastTicker := time.NewTicker(s.config.ScalingUpTicker.Duration)
 	// Slower evaluation ticker for scale-down decisions
 	slowTicker := time.NewTicker(s.config.ScalingDownTicker.Duration)
+
+	log.Printf("Auth scaler started with fast interval %v and slow interval %v", s.config.ScalingUpTicker.Duration, s.config.ScalingDownTicker.Duration)
 
 	defer fastTicker.Stop()
 	defer slowTicker.Stop()
@@ -93,12 +95,14 @@ func (s *Scaler) evaluateScaleUp() {
 
 	// Don't scale up if we've scaled up very recently
 	if time.Since(s.lastScaleUp) < s.config.ScaleUpCooldown.Duration {
+		log.Printf("Skipping scale up, last scale up was %v ago", time.Since(s.lastScaleUp))
 		return
 	}
 
 	metrics := s.getCurrentMetrics()
 	if s.shouldScaleUp(metrics) {
 		scaleFactor := s.calculateScaleUpFactor(metrics)
+		log.Printf("Scaling up by %v workers", scaleFactor)
 		s.scaleUpWorkers(scaleFactor)
 	}
 }
@@ -111,6 +115,7 @@ func (s *Scaler) evaluateScaleDown() {
 
 	// Don't scale down if we've scaled down very recently
 	if time.Since(s.lastScaleDown) < s.config.ScaleDownCooldown.Duration {
+		log.Printf("Skipping scale down, last scale down was %v ago", time.Since(s.lastScaleDown))
 		return
 	}
 
@@ -122,7 +127,7 @@ func (s *Scaler) evaluateScaleDown() {
 
 func (s *Scaler) shouldScaleUp(metrics ScalerMetrics) bool {
 	// Check various factors that might indicate need to scale up
-	if metrics.LoadFactor > s.scaleUpThreshold {
+	if metrics.LoadFactor > s.config.ScaleUpThreshold {
 		return true
 	}
 
@@ -155,12 +160,12 @@ func (s *Scaler) shouldScaleDown(metrics ScalerMetrics) bool {
 	}
 
 	// Ensure we're not at minimum workers
-	return metrics.WorkerCount > s.config.MinWorkers
+	return metrics.WorkerCount > s.consumerConfig.MinWorkers
 }
 
 func (s *Scaler) calculateScaleUpFactor(metrics ScalerMetrics) int {
 	// Base scale factor on how far we are above threshold
-	loadDelta := metrics.LoadFactor - s.scaleUpThreshold
+	loadDelta := metrics.LoadFactor - s.config.ScaleUpThreshold
 	scaleFactor := 1
 
 	// Quick response to severe overload
@@ -196,7 +201,7 @@ func (s *Scaler) calculateScaleUpFactor(metrics ScalerMetrics) int {
 
 func (s *Scaler) scaleUpWorkers(scaleFactor int) {
 	currentMetrics := s.getCurrentMetrics()
-	maxNewWorkers := s.config.MaxWorkers - currentMetrics.WorkerCount
+	maxNewWorkers := s.consumerConfig.MaxWorkers - currentMetrics.WorkerCount
 
 	if maxNewWorkers <= 0 {
 		fmt.Println("Cannot scale up, already at max workers")
@@ -244,7 +249,7 @@ func (s *Scaler) updateMetrics() {
 	// Keep only last 5 minutes of metrics
 	i := 0
 	for ; i < len(s.metricsWindow); i++ {
-		if time.Now().Sub(time.Unix(int64(i), 0)) < 5*time.Minute {
+		if time.Now().Sub(time.Unix(int64(i), 0)) < s.config.MetricsWindow.Duration {
 			break
 		}
 	}
@@ -327,7 +332,7 @@ func (s *Scaler) isConsistentlyBelowThreshold() bool {
 	window := s.metricsWindow[len(s.metricsWindow)-6:]
 
 	for _, metrics := range window {
-		if metrics.LoadFactor > s.scaleDownThreshold {
+		if metrics.LoadFactor > s.config.ScaleDownThreshold {
 			return false
 		}
 	}

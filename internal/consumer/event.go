@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"log"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ const (
 type Event struct {
 	ID           string
 	QueueURL     string
+	QueueName    string
 	Message      *types.Message
 	Priority     Priority
 	ReceivedAt   time.Time
@@ -80,6 +82,8 @@ func NewEventBuffer(cfg config.BufferConfig, workerCount int) *EventBuffer {
 	highSize := int(float64(totalSize) * cfg.HighPriorityPercent)
 	mediumSize := int(float64(totalSize) * cfg.MediumPriorityPercent)
 	lowSize := int(float64(totalSize) * cfg.LowPriorityPercent)
+
+	log.Printf("Buffer initialized: high=%d, medium=%d, low=%d\n", highSize, mediumSize, lowSize)
 
 	return &EventBuffer{
 		highPriority:   make(chan *Event, highSize),

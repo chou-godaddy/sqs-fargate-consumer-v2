@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"log"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sqs-fargate-consumer-v2/internal/scheduler"
@@ -84,13 +85,15 @@ func (w *Worker) Start(ctx context.Context) error {
 				continue
 			}
 
+			log.Printf("Worker %s polling %d messages from queue %s", w.id, maxMessages, queue.Name)
+
 			w.status.Store(WorkerStatusPolling)
 			messages, err := w.pollMessages(ctx, queue, maxMessages)
 			w.status.Store(WorkerStatusIdle)
 
 			if err != nil {
-				w.collector.RecordError(queue.URL, "poll_error")
-				fmt.Printf("Error polling messages: %v", err)
+				w.collector.RecordError(queue.Name, "poll_error")
+				log.Printf("Worker %s encountered an error polling queue %s: %v", w.id, queue.Name, err)
 				time.Sleep(time.Second) // Backoff on error
 				continue
 			}
@@ -99,6 +102,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			for _, msg := range messages {
 				event := &Event{
 					QueueURL:   queue.URL,
+					QueueName:  queue.Name,
 					Message:    &msg,
 					Priority:   Priority(queue.Priority),
 					ReceivedAt: time.Now(),
@@ -107,13 +111,15 @@ func (w *Worker) Start(ctx context.Context) error {
 
 				// Try to push to buffer, stop polling if buffer is full
 				if err := w.buffer.Push(event); err != nil {
-					fmt.Printf("Error pushing event to buffer: %v", err)
-					w.collector.RecordError(queue.URL, "buffer_full")
+					log.Printf("Worker %s polled %d messages from queue %s but buffer is full", w.id, len(messages), queue.Name)
+					w.collector.RecordError(queue.Name, "buffer_full")
 					break
 				}
 
 				w.messageCount.Add(1)
 			}
+
+			log.Printf("Worker %s polled %d messages from queue %s and pushed to buffer channel", w.id, len(messages), queue.Name)
 
 			w.lastPollTime = time.Now()
 		}

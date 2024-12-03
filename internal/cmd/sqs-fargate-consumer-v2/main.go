@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -10,13 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	goapi "github.com/gdcorp-domains/fulfillment-go-api"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/consumer"
 	"sqs-fargate-consumer-v2/internal/dependencies"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sqs-fargate-consumer-v2/internal/processor"
 	"sqs-fargate-consumer-v2/internal/scaler"
+
+	goapi "github.com/gdcorp-domains/fulfillment-go-api"
 )
 
 func health(deps interface{}) error {
@@ -28,9 +31,14 @@ func main() {
 	flag.Parse()
 
 	// Load configuration
-	cfg, err := config.LoadConfig(*configLocation)
-	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+	cfg := &config.Config{}
+
+	if *configLocation == "" {
+		panic("config file path cannot be empty")
+	}
+
+	if err := cfg.Load(*configLocation); err != nil {
+		panic(fmt.Errorf("failed to load config from %s: %w", *configLocation, err))
 	}
 
 	cfg.Config.Server.HealthChecks = []func(interface{}) error{health}
@@ -66,17 +74,20 @@ func main() {
 		buffer,
 		handleMessage,
 		collector,
+		dep.SQSClient,
 	)
 
 	// Create auto-scaler
 	autoScaler := scaler.NewScaler(
 		consumerGroup,
 		collector,
+		&cfg.ScalerConfig,
 		&cfg.ConsumerGroupConfig,
 	)
 
 	// Start health, ready check server
 	go func() {
+		log.Println("Starting health check server...")
 		if err := svr.Start(); err != nil {
 			log.Printf("failed to start server: %v", err)
 		}
@@ -91,24 +102,29 @@ func main() {
 
 	// Start components
 	go func() {
+		log.Println("Starting metrics collector...")
 		if err := collector.Start(ctx); err != nil {
 			errChan <- fmt.Errorf("Failed to start metrics collector: %v", err)
 		}
+		log.Println("Metrics collector started")
 	}()
 
 	go func() {
+		log.Println("Starting consumer group...")
 		if err := consumerGroup.Start(ctx); err != nil {
 			errChan <- fmt.Errorf("Failed to start consumer group: %v", err)
 		}
 	}()
 
 	go func() {
+		log.Println("Starting message processor...")
 		if err := messageProcessor.Start(ctx); err != nil {
 			errChan <- fmt.Errorf("Failed to start message processor: %v", err)
 		}
 	}()
 
 	go func() {
+		log.Println("Starting auto-scaler...")
 		if err := autoScaler.Start(ctx); err != nil {
 			errChan <- fmt.Errorf("Failed to start auto-scaler: %v", err)
 		}
@@ -164,12 +180,23 @@ func handleMessage(ctx context.Context, event *consumer.Event) error {
 	msg := event.Message
 	fmt.Printf("Processing message: %s from queue: %s\n", *msg.MessageId, event.QueueURL)
 
-	// Simulate some work
+	// Create a random source using crypto/rand for better randomization
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Errorf("failed to generate random number: %v", err)
+	}
+
+	// Convert to uint64 and calculate random duration between 2s and 20s
+	randomNum := binary.BigEndian.Uint64(b[:])
+	durationMs := 2000 + (randomNum % 18001) // 2000ms to 20000ms
+
+	// Simulate work with context cancellation support
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(time.Duration(100+time.Now().UnixNano()%900) * time.Millisecond):
-		// Random processing time between 100ms and 1s
+	case <-time.After(time.Duration(durationMs) * time.Millisecond):
+		// Processing completed
+		log.Printf("Processed message %s in %dms", *msg.MessageId, durationMs)
 	}
 
 	return nil
