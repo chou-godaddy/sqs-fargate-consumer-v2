@@ -27,6 +27,7 @@ require (
 	github.com/gdcorp-domains/fulfillment-sql-data-api-client v1.0.41
 	github.com/gdcorp-domains/fulfillment-worker-helper v1.0.17
 	github.com/gdcorp-uxp/switchboard-client/go/switchboard v1.9.0
+	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f
 )
 
 require (
@@ -124,7 +125,6 @@ require (
 	go.elastic.co/fastjson v1.3.0 // indirect
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/crypto v0.28.0 // indirect
-	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f // indirect
 	golang.org/x/lint v0.0.0-20210508222113-6edffad5e616 // indirect
 	golang.org/x/mod v0.21.0 // indirect
 	golang.org/x/net v0.30.0 // indirect

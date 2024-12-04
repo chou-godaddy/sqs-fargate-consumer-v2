@@ -33,23 +33,23 @@ type Collector struct {
 
 func NewCollector(sqsClient *sqs.Client, cloudwatchClient *cloudwatch.Client, queues []config.QueueConfig) interfaces.MetricsCollector {
 	if sqsClient == nil {
-        log.Fatal("[Collector] SQS client cannot be nil")
-    }
-    if cloudwatchClient == nil {
-        log.Fatal("[Collector] CloudWatch client cannot be nil")
-    }
-    if len(queues) == 0 {
-        log.Fatal("[Collector] Queue configuration cannot be empty")
-    }
+		log.Fatal("[Collector] SQS client cannot be nil")
+	}
+	if cloudwatchClient == nil {
+		log.Fatal("[Collector] CloudWatch client cannot be nil")
+	}
+	if len(queues) == 0 {
+		log.Fatal("[Collector] Queue configuration cannot be empty")
+	}
 
-    queueMap := make(map[string]string)
-    for _, queue := range queues {
-        if queue.Name == "" || queue.URL == "" {
-            log.Fatal("[Collector] Queue name and URL cannot be empty")
-        }
-        queueMap[queue.Name] = queue.URL
-    }
-	
+	queueMap := make(map[string]string)
+	for _, queue := range queues {
+		if queue.Name == "" || queue.URL == "" {
+			log.Fatal("[Collector] Queue name and URL cannot be empty")
+		}
+		queueMap[queue.Name] = queue.URL
+	}
+
 	return &Collector{
 		sqsClient:        sqsClient,
 		cloudwatchClient: cloudwatchClient,

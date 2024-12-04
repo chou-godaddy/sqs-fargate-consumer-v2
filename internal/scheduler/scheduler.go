@@ -144,41 +144,41 @@ func (s *SchedulerImpl) filterQueuesWithMessages(priority int) []config.QueueCon
 
 // calculateQueueScore determines queue selection priority
 func (s *SchedulerImpl) calculateQueueScore(queue config.QueueConfig, now time.Time) float64 {
-    metrics := s.collector.GetQueueMetrics(queue.Name)
-    if metrics == nil {
-        return 0
-    }
+	metrics := s.collector.GetQueueMetrics(queue.Name)
+	if metrics == nil {
+		return 0
+	}
 
-    // Base score starts with message count and weight
-    baseScore := float64(metrics.MessageCount) * queue.Weight
+	// Base score starts with message count and weight
+	baseScore := float64(metrics.MessageCount) * queue.Weight
 
-    // Priority multiplier ensures high priority queues maintain precedence
-    // Priority 3 (High)   = 1000x
-    // Priority 2 (Medium) = 100x
-    // Priority 1 (Low)    = 10x
-    priorityMultiplier := math.Pow(10, float64(queue.Priority+1))
-    score := baseScore * priorityMultiplier
+	// Priority multiplier ensures high priority queues maintain precedence
+	// Priority 3 (High)   = 1000x
+	// Priority 2 (Medium) = 100x
+	// Priority 1 (Low)    = 10x
+	priorityMultiplier := math.Pow(10, float64(queue.Priority+1))
+	score := baseScore * priorityMultiplier
 
-    // Add a capped wait time factor
-    lastPoll, exists := s.lastPollTimes[queue.Name]
-    if exists {
-        waitTime := now.Sub(lastPoll).Seconds()
-        // Cap the wait time boost to prevent overwhelming priority
-        maxWaitBoost := float64(queue.Priority) * 0.5 // Higher priority = smaller max boost
-        waitFactor := math.Min(1.0+(waitTime/30.0), 1.0+maxWaitBoost)
-        score *= waitFactor
-    }
+	// Add a capped wait time factor
+	lastPoll, exists := s.lastPollTimes[queue.Name]
+	if exists {
+		waitTime := now.Sub(lastPoll).Seconds()
+		// Cap the wait time boost to prevent overwhelming priority
+		maxWaitBoost := float64(queue.Priority) * 0.5 // Higher priority = smaller max boost
+		waitFactor := math.Min(1.0+(waitTime/30.0), 1.0+maxWaitBoost)
+		score *= waitFactor
+	}
 
-    // Apply reduced poll count penalty
-    pollCount := s.pollCounts[queue.Name]
-    if pollCount > 10 {
-        score *= 0.95 // Reduced penalty to 5%
-    }
+	// Apply reduced poll count penalty
+	pollCount := s.pollCounts[queue.Name]
+	if pollCount > 10 {
+		score *= 0.95 // Reduced penalty to 5%
+	}
 
-    log.Printf("[Scheduler] Queue %s score details - Priority: %d, Messages: %d, Base Score: %.2f, "+
-        "Final Score: %.2f", queue.Name, queue.Priority, metrics.MessageCount, baseScore, score)
+	log.Printf("[Scheduler] Queue %s score details - Priority: %d, Messages: %d, Base Score: %.2f, "+
+		"Final Score: %.2f", queue.Name, queue.Priority, metrics.MessageCount, baseScore, score)
 
-    return score
+	return score
 }
 
 // updateQueueStats updates tracking information for selected queue

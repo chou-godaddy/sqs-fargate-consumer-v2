@@ -165,14 +165,14 @@ func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
 	// Process received messages
 	for _, msg := range result.Messages {
 		message := &models.Message{
-			QueueURL:   queue.URL,
-			QueueName:  queue.Name,
-			Priority:   models.Priority(queue.Priority),
-			MessageID:  *msg.MessageId,
-			Body:       []byte(*msg.Body),
+			QueueURL:      queue.URL,
+			QueueName:     queue.Name,
+			Priority:      models.Priority(queue.Priority),
+			MessageID:     *msg.MessageId,
+			Body:          []byte(*msg.Body),
 			ReceiptHandle: msg.ReceiptHandle,
-			Size:       int64(len(*msg.Body)),
-			ReceivedAt: time.Now(),
+			Size:          int64(len(*msg.Body)),
+			ReceivedAt:    time.Now(),
 		}
 
 		if err := cg.buffer.Push(message); err != nil {

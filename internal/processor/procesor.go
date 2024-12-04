@@ -2,6 +2,7 @@ package processor
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"sqs-fargate-consumer-v2/internal/config"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"golang.org/x/exp/rand"
 )
 
 type MessageProcessorImpl struct {
@@ -153,8 +155,32 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	processCtx, cancel := context.WithTimeout(ctx, w.processor.config.ProcessTimeout.Duration)
 	defer cancel()
 
-	log.Printf("[Worker %s] Processed message id %s, priority %d, body %s from queue %s", w.id, msg.MessageID, msg.Priority, string(msg.Body), msg.QueueName)
+	// Generate random processing duration
+	var randomDuration time.Duration
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fallback to simple time-based random calculation if crypto/rand fails
+		randomSeconds := time.Now().UnixNano()%2 + 1 // 1 to 3 seconds
+		randomDuration = time.Duration(randomSeconds) * time.Second
+	} else {
+		randomInt := binary.BigEndian.Uint64(b[:])
+		randomSeconds := (randomInt % 2) + 1 // 1 to 3 seconds
+		randomDuration = time.Duration(randomSeconds) * time.Second
+	}
 
+	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s. Expected duration: %v",
+		w.id, msg.MessageID, msg.Priority, msg.QueueName, randomDuration)
+
+	// Simulate processing with random duration
+	select {
+	case <-processCtx.Done():
+		return fmt.Errorf("message id %s processing timed out after %v", msg.MessageID, time.Since(startTime))
+	case <-time.After(randomDuration):
+		// Processing completed
+	}
+
+	log.Printf("[Worker %s] Finished processing message id %s, body: %s in %v",
+		w.id, msg.MessageID, string(msg.Body), randomDuration)
 
 	// Delete message from SQS
 	if err := w.deleteMessage(processCtx, msg); err != nil {
