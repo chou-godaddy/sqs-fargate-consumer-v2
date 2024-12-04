@@ -13,61 +13,37 @@ import (
 	rgclient "github.com/gdcorp-domains/fulfillment-rg-client"
 )
 
-type QueueConfig struct {
-	URL          string   `json:"url"`          // URL of the queue
-	Name         string   `json:"name"`         // Name of the queue
-	Priority     int      `json:"priority"`     // 1-3, higher number = higher priority
-	Weight       float64  `json:"weight"`       // Weight for queue selection (0-1)
-	MaxBatchSize int      `json:"maxBatchSize"` // Maximum number of messages to poll at once
-	PollInterval Duration `json:"pollInterval"` // Minimum time between polls
-}
-
-type ConsumerGroupConfig struct {
-	MaxWorkers int           `json:"maxWorkers"` // Maximum number of worker consumers
-	MinWorkers int           `json:"minWorkers"` // Minimum number of worker consumers
-	BufferSize int           `json:"bufferSize"` // Size of the buffer channel
-	Queues     []QueueConfig `json:"queues"`     // Queues to consume from
-}
-
-type ScalerConfig struct {
-	MetricsWindow      Duration `json:"metricsWindow"`      // How long to keep metrics
-	ScaleUpThreshold   float64  `json:"scaleUpThreshold"`   // Percentage (0-1)
-	ScaleDownThreshold float64  `json:"scaleDownThreshold"` // Percentage (0-1)
-	ScaleUpCooldown    Duration `json:"scaleUpCooldown"`    // Minimum time between scale ups
-	ScaleDownCooldown  Duration `json:"scaleDownCooldown"`  // Minimum time between scale downs
-	ScalingUpTicker    Duration `json:"scalingUpTicker"`    // How often to check for scaling up
-	ScalingDownTicker  Duration `json:"scalingDownTicker"`  // How often to check for scaling down
-}
-
-type MetricsConfig struct {
-	Namespace       string   `json:"namespace"`       // CloudWatch namespace
-	Region          string   `json:"region"`          // AWS region
-	PublishInterval Duration `json:"publishInterval"` // How often to publish metrics
-	RetentionPeriod Duration `json:"retentionPeriod"` // How long to keep metrics
-	MaxDataPoints   int      `json:"maxDataPoints"`   // Maximum number of data points to store
+type ConsumerConfig struct {
+	MaxWorkers     int           `json:"maxWorkers"`
+	MinWorkers     int           `json:"minWorkers"`
+	PollInterval   Duration      `json:"pollInterval"`
+	MaxBatchSize   int           `json:"maxBatchSize"`
+	ScaleInterval  Duration      `json:"scaleInterval"`
+	ScaleThreshold float64       `json:"scaleThreshold"`
+	Queues         []QueueConfig `json:"queues"`
 }
 
 type BufferConfig struct {
-	InitialSize           int     `json:"initialSize"`           // Initial buffer size
-	MaxSize               int     `json:"maxSize"`               // Maximum buffer size
-	HighPriorityPercent   float64 `json:"highPriorityPercent"`   // Percentage for high priority (0-1)
-	MediumPriorityPercent float64 `json:"mediumPriorityPercent"` // Percentage for medium priority (0-1)
-	LowPriorityPercent    float64 `json:"lowPriorityPercent"`    // Percentage for low priority (0-1)
-	ScaleUpThreshold      float64 `json:"scaleUpThreshold"`      // Utilization threshold to scale up (0-1)
-	ScaleDownThreshold    float64 `json:"scaleDownThreshold"`    // Utilization threshold to scale down (0-1)
-	MaxMessageSize        int64   `json:"maxMessageSize"`        // Maximum size of a single message
-	MemoryLimit           int64   `json:"memoryLimit"`           // Maximum total memory usage
-	ScaleIncrement        float64 `json:"scaleIncrement"`        // How much to scale by (e.g., 1.2 = 20% increase)
-	MaxOverflowCount      int64   `json:"maxOverflowCount"`      // Maximum number of overflows before scaling
+	HighPrioritySize   int     `json:"highPrioritySize"`
+	MediumPrioritySize int     `json:"mediumPrioritySize"`
+	LowPrioritySize    int     `json:"lowPrioritySize"`
+	MaxMessageSize     int64   `json:"maxMessageSize"`
+	ScaleThreshold     float64 `json:"scaleThreshold"`
 }
 
 type ProcessorConfig struct {
-	MaxConcurrency     int      // Maximum number of concurrent message processors
-	MinConcurrency     int      // Minimum number of concurrent processors to maintain
-	ProcessTimeout     Duration // Maximum time to process a single message
-	ScaleUpThreshold   float64  // Buffer utilization threshold to scale up processors (0-1)
-	ScaleDownThreshold float64  // Buffer utilization threshold to scale down processors (0-1)
-	ScaleInterval      Duration // How often to check scaling
+	MaxWorkers     int      `json:"maxWorkers"`
+	MinWorkers     int      `json:"minWorkers"`
+	ProcessTimeout Duration `json:"processTimeout"`
+	ScaleInterval  Duration `json:"scaleInterval"`
+	ScaleThreshold float64  `json:"scaleThreshold"`
+}
+
+type QueueConfig struct {
+	Name     string  `json:"name"`
+	URL      string  `json:"url"`
+	Priority int     `json:"priority"`
+	Weight   float64 `json:"weight"`
 }
 
 type Config struct {
@@ -84,11 +60,9 @@ type Config struct {
 	SwitchboardAPIURL          string                 `json:"switchboardApiUrl"`
 	RegistryConfig             rgclient.Config        `json:"registryConfig"`
 	MSMQURL                    string                 `json:"genericQueueEndpointUrl"`
-	ConsumerGroupConfig        ConsumerGroupConfig    `json:"consumer"`
-	MetricsConfig              MetricsConfig          `json:"metrics"`
-	BufferConfig               BufferConfig           `json:"buffer"`
-	ProcessorConfig            ProcessorConfig        `json:"processor"`
-	ScalerConfig               ScalerConfig           `json:"scaler"`
+	Consumer                   ConsumerConfig         `json:"consumer"`
+	Buffer                     BufferConfig           `json:"buffer"`
+	Processor                  ProcessorConfig        `json:"processor"`
 }
 
 // Duration wraps time.Duration for JSON unmarshaling
@@ -116,18 +90,32 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Validate performs validation of the configuration
-func (c *Config) Validate() error {
-	if c.ConsumerGroupConfig.MinWorkers <= 0 {
-		return fmt.Errorf("minimum workers must be greater than 0")
+func validateConfig(cfg *Config) error {
+	if cfg.Consumer.MaxWorkers < cfg.Consumer.MinWorkers {
+		return fmt.Errorf("max workers must be greater than min workers")
 	}
-	if c.ConsumerGroupConfig.MaxWorkers < c.ConsumerGroupConfig.MinWorkers {
-		return fmt.Errorf("maximum workers must be greater than or equal to minimum workers")
+
+	if cfg.Consumer.MaxBatchSize <= 0 || cfg.Consumer.MaxBatchSize > 10 {
+		return fmt.Errorf("batch size must be between 1 and 10")
 	}
-	if c.BufferConfig.HighPriorityPercent+c.BufferConfig.MediumPriorityPercent+c.BufferConfig.LowPriorityPercent != 1.0 {
-		return fmt.Errorf("buffer priority percentages must sum to 1.0")
+
+	if cfg.Buffer.MaxMessageSize <= 0 {
+		return fmt.Errorf("max message size must be positive")
 	}
-	// Add more validation
+
+	if len(cfg.Consumer.Queues) == 0 {
+		return fmt.Errorf("at least one queue must be configured")
+	}
+
+	for _, queue := range cfg.Consumer.Queues {
+		if queue.Priority < 1 || queue.Priority > 3 {
+			return fmt.Errorf("queue priority must be between 1 and 3")
+		}
+		if queue.Weight <= 0 || queue.Weight > 1 {
+			return fmt.Errorf("queue weight must be between 0 and 1")
+		}
+	}
+
 	return nil
 }
 
@@ -165,5 +153,10 @@ func (conf *Config) Load(configPath string) (err error) {
 	if err := json.Unmarshal(buf.Bytes(), conf); err != nil {
 		return err
 	}
+
+	if err := validateConfig(conf); err != nil {
+		return fmt.Errorf("failed to validate config: %w", err)
+	}
+
 	return nil
 }

@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -15,9 +13,10 @@ import (
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/consumer"
 	"sqs-fargate-consumer-v2/internal/dependencies"
+	"sqs-fargate-consumer-v2/internal/interfaces"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sqs-fargate-consumer-v2/internal/processor"
-	"sqs-fargate-consumer-v2/internal/scaler"
+	"sqs-fargate-consumer-v2/internal/scheduler"
 
 	goapi "github.com/gdcorp-domains/fulfillment-go-api"
 )
@@ -50,41 +49,6 @@ func main() {
 		panic(fmt.Errorf("failed to create goapi server: %w", err))
 	}
 
-	// Create metrics collector
-	collector := metrics.NewCollector(dep.CloudwatchClient, dep.SQSClient, &cfg.MetricsConfig, cfg.ConsumerGroupConfig.Queues)
-
-	// Create event buffer
-	buffer := consumer.NewEventBuffer(cfg.BufferConfig, cfg.ConsumerGroupConfig.MinWorkers)
-
-	// Create consumer group
-	consumerGroup := consumer.NewConsumer(&cfg.ConsumerGroupConfig, dep.SQSClient, collector, buffer)
-
-	// Create message processor
-	processorCfg := config.ProcessorConfig{
-		MaxConcurrency:     cfg.ProcessorConfig.MaxConcurrency,
-		MinConcurrency:     cfg.ProcessorConfig.MinConcurrency,
-		ProcessTimeout:     cfg.ProcessorConfig.ProcessTimeout,
-		ScaleUpThreshold:   cfg.ProcessorConfig.ScaleUpThreshold,
-		ScaleDownThreshold: cfg.ProcessorConfig.ScaleDownThreshold,
-		ScaleInterval:      cfg.ProcessorConfig.ScaleInterval,
-	}
-
-	messageProcessor := processor.NewMessageProcessor(
-		processorCfg,
-		buffer,
-		handleMessage,
-		collector,
-		dep.SQSClient,
-	)
-
-	// Create auto-scaler
-	autoScaler := scaler.NewScaler(
-		consumerGroup,
-		collector,
-		&cfg.ScalerConfig,
-		&cfg.ConsumerGroupConfig,
-	)
-
 	// Start health, ready check server
 	go func() {
 		log.Println("Starting health check server...")
@@ -93,111 +57,61 @@ func main() {
 		}
 	}()
 
-	// Create context with cancellation
+	// Create metrics collector
+	collector := metrics.NewCollector(dep.SQSClient, dep.CloudwatchClient, cfg.Consumer.Queues)
+
+	// Create message buffer
+	buffer := consumer.NewMessageBuffer(cfg.Buffer)
+
+	// Create scheduler
+	scheduler := scheduler.NewScheduler(cfg.Consumer.Queues, collector)
+
+	// Create consumer group
+	consumerGroup := consumer.NewConsumerGroup(cfg.Consumer, dep.SQSClient, scheduler, buffer, collector)
+
+	// Create message processor
+	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep.SQSClient, collector)
+
+	// Create root context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create error channel for component errors
-	errChan := make(chan error, 4)
-
 	// Start components
-	go func() {
-		log.Println("Starting metrics collector...")
-		if err := collector.Start(ctx); err != nil {
-			errChan <- fmt.Errorf("Failed to start metrics collector: %v", err)
+	startComponents(ctx, collector, consumerGroup, processor)
+
+	// Wait for shutdown signal
+	handleGracefulShutdown(cancel, collector, consumerGroup, processor)
+}
+
+func startComponents(ctx context.Context, components ...interfaces.Component) {
+	for _, comp := range components {
+		if err := comp.Start(ctx); err != nil {
+			log.Fatalf("Failed to start component: %v", err)
 		}
-		log.Println("Metrics collector started")
-	}()
-
-	go func() {
-		log.Println("Starting consumer group...")
-		if err := consumerGroup.Start(ctx); err != nil {
-			errChan <- fmt.Errorf("Failed to start consumer group: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Println("Starting message processor...")
-		if err := messageProcessor.Start(ctx); err != nil {
-			errChan <- fmt.Errorf("Failed to start message processor: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Println("Starting auto-scaler...")
-		if err := autoScaler.Start(ctx); err != nil {
-			errChan <- fmt.Errorf("Failed to start auto-scaler: %v", err)
-		}
-	}()
-
-	// Create shutdown signal channel
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGTERM, syscall.SIGINT)
-
-	select {
-	case err := <-errChan:
-		log.Printf("Fatal error: %v", err)
-		// Initiate shutdown on fatal error
-		shutdown <- syscall.SIGTERM
-
-	case sig := <-shutdown:
-		log.Printf("Shutdown signal (%v) received, initiating graceful shutdown...", sig)
-
-		// Create shutdown context with timeout
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		log.Println("Stopping scaler...")
-		autoScaler.Shutdown(shutdownCtx)
-
-		log.Println("Stopping message processor...")
-		if err := messageProcessor.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Error shutting down message processor: %v", err)
-		}
-
-		log.Println("Stopping consumer group...")
-		if err := consumerGroup.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Error shutting down consumer group: %v", err)
-		}
-
-		log.Println("Stopping metrics collector...")
-		collector.Shutdown(shutdownCtx)
-
-		log.Println("Stopping health check server...")
-		svr.Stop()
-
-		select {
-		case <-shutdownCtx.Done():
-			log.Println("Shutdown timeout reached, forcing exit")
-		default:
-			log.Println("Graceful shutdown completed")
-		}
-
 	}
 }
 
-func handleMessage(ctx context.Context, event *consumer.Event) error {
-	msg := event.Message
-	fmt.Printf("Processing message: %s from queue: %s\n", *msg.MessageId, event.QueueURL)
+func handleGracefulShutdown(cancel context.CancelFunc, components ...interfaces.Component) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Create a random source using crypto/rand for better randomization
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Errorf("failed to generate random number: %v", err)
+	sig := <-signalChan
+	log.Printf("Received shutdown signal: %v", sig)
+	cancel()
+
+	// Create shutdown context with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// Shutdown components in reverse order
+	for i := len(components) - 1; i >= 0; i-- {
+		componentName := fmt.Sprintf("%T", components[i])
+		log.Printf("Shutting down %s...", componentName)
+
+		if err := components[i].Shutdown(shutdownCtx); err != nil {
+			log.Printf("Error shutting down %s: %v", componentName, err)
+		} else {
+			log.Printf("Successfully shut down %s", componentName)
+		}
 	}
-
-	// Convert to uint64 and calculate random duration between 2s and 20s
-	randomNum := binary.BigEndian.Uint64(b[:])
-	durationMs := 2000 + (randomNum % 18001) // 2000ms to 20000ms
-
-	// Simulate work with context cancellation support
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(time.Duration(durationMs) * time.Millisecond):
-		// Processing completed
-		log.Printf("Processed message %s in %dms", *msg.MessageId, durationMs)
-	}
-
-	return nil
 }

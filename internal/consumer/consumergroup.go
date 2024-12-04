@@ -4,350 +4,307 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sort"
+	"math"
 	"sqs-fargate-consumer-v2/internal/config"
-	"sqs-fargate-consumer-v2/internal/metrics"
-	"sqs-fargate-consumer-v2/internal/scheduler"
+	"sqs-fargate-consumer-v2/internal/interfaces"
+	"sqs-fargate-consumer-v2/internal/models"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type ConsumerGroup struct {
-	config    *config.ConsumerGroupConfig
-	client    *sqs.Client
-	scheduler *scheduler.Scheduler
-	buffer    *EventBuffer
-	collector *metrics.Collector
+	config    config.ConsumerConfig
+	sqsClient *sqs.Client
+	scheduler interfaces.Scheduler
+	buffer    interfaces.MessageBuffer
+	collector interfaces.MetricsCollector
 
-	workers   map[string]*ConsumerWorker
-	workersMu sync.RWMutex
+	workers     map[string]*Consumer
+	workerCount atomic.Int32
+	mu          sync.RWMutex
 
-	// Worker ID management
-	nextWorkerID atomic.Int32
-	workerIDs    []int32 // Pool of available worker IDs
-	idPoolMu     sync.Mutex
-
-	// Worker status tracking
-	workerStatus map[string]*ConsumerWorkerStatus
-	statusMu     sync.RWMutex
-
-	// Coordination
-	shuttingDown atomic.Bool
-	startupDone  atomic.Bool
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+	wg         sync.WaitGroup
 }
 
-type ConsumerWorkerStatus struct {
-	ID             string
-	NumericID      int32
-	State          int32 // 0: idle, 1: polling, 2: stopped
-	LastActiveTime time.Time
-	LastIdleTime   time.Time
-	MessageCount   atomic.Int64
-	StartTime      time.Time
+type Consumer struct {
+	id       string
+	queueURL string
+	status   atomic.Int32
+	msgCount atomic.Int64
+	lastPoll time.Time
+	stopChan chan struct{}
 }
 
-func NewConsumer(cfg *config.ConsumerGroupConfig, client *sqs.Client, collector *metrics.Collector, buffer *EventBuffer) *ConsumerGroup {
+const (
+	consumerStatusIdle int32 = iota
+	consumerStatusPolling
+	consumerStatusStopped
+)
+
+func NewConsumerGroup(
+	config config.ConsumerConfig,
+	sqsClient *sqs.Client,
+	scheduler interfaces.Scheduler,
+	buffer interfaces.MessageBuffer,
+	collector interfaces.MetricsCollector,
+) *ConsumerGroup {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ConsumerGroup{
-		config:       cfg,
-		client:       client,
-		buffer:       buffer,
-		collector:    collector,
-		workers:      make(map[string]*ConsumerWorker),
-		workerStatus: make(map[string]*ConsumerWorkerStatus),
-		scheduler:    scheduler.NewScheduler(cfg.Queues, collector),
+		config:     config,
+		sqsClient:  sqsClient,
+		scheduler:  scheduler,
+		buffer:     buffer,
+		collector:  collector,
+		workers:    make(map[string]*Consumer),
+		ctx:        ctx,
+		cancelFunc: cancel,
 	}
 }
 
-func (c *ConsumerGroup) Start(ctx context.Context) error {
-	log.Printf("[ConsumerGroup] Starting consumer group with configuration - Min workers: %d, Max workers: %d",
-		c.config.MinWorkers, c.config.MaxWorkers)
-
-	// Initialize worker ID pool
-	for i := int32(0); i < int32(c.config.MinWorkers); i++ {
-		c.workerIDs = append(c.workerIDs, i)
-	}
-	sort.Slice(c.workerIDs, func(i, j int) bool {
-		return c.workerIDs[i] < c.workerIDs[j]
-	})
-	log.Printf("[ConsumerGroup] Initialized worker ID pool with %d IDs", len(c.workerIDs))
+func (cg *ConsumerGroup) Start(ctx context.Context) error {
+	log.Printf("[ConsumerGroup] Starting with initial workers: %d", cg.config.MinWorkers)
 
 	// Start initial workers
-	for i := 0; i < c.config.MinWorkers; i++ {
-		if err := c.AddWorker(); err != nil {
-			log.Printf("[ConsumerGroup] Fatal error starting initial workers: %v", err)
-			return fmt.Errorf("fatal error starting initial workers: %w", err)
+	for i := 0; i < cg.config.MinWorkers; i++ {
+		if err := cg.startWorker(); err != nil {
+			return fmt.Errorf("failed to start initial worker: %w", err)
 		}
 	}
 
-	c.startupDone.Store(true)
-	log.Printf("[ConsumerGroup] Successfully started with %d workers", c.config.MinWorkers)
-
-	// Start monitoring routines
-	go c.monitorWorkerStatus(ctx)
-	go c.monitorWorkerHealth(ctx)
+	// Start scaling routine
+	go cg.monitorAndScale()
 
 	return nil
 }
 
-func (c *ConsumerGroup) getNextWorkerID() int32 {
-	c.idPoolMu.Lock()
-	defer c.idPoolMu.Unlock()
+func (cg *ConsumerGroup) startWorker() error {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
 
-	if len(c.workerIDs) > 0 {
-		id := c.workerIDs[0]
-		c.workerIDs = c.workerIDs[1:]
-		return id
-	}
-
-	return c.nextWorkerID.Add(1)
-}
-
-func (c *ConsumerGroup) returnWorkerID(id int32) {
-	c.idPoolMu.Lock()
-	defer c.idPoolMu.Unlock()
-
-	c.workerIDs = append(c.workerIDs, id)
-	sort.Slice(c.workerIDs, func(i, j int) bool {
-		return c.workerIDs[i] < c.workerIDs[j]
-	})
-}
-
-func (c *ConsumerGroup) AddWorker() error {
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
-
-	if len(c.workers) >= c.config.MaxWorkers {
-		log.Printf("[ConsumerGroup] Cannot add worker: maximum worker count (%d) reached", c.config.MaxWorkers)
+	if cg.workerCount.Load() >= int32(cg.config.MaxWorkers) {
 		return fmt.Errorf("maximum worker count reached")
 	}
 
-	numericID := c.getNextWorkerID()
-	workerID := fmt.Sprintf("consumer-worker-%d", numericID)
-
-	log.Printf("[ConsumerGroup] Creating new worker with ID: %s", workerID)
-
-	worker := NewConsumerWorker(workerID, c.buffer, c.scheduler, c.client, c.collector)
-	c.workers[workerID] = worker
-
-	status := &ConsumerWorkerStatus{
-		ID:             workerID,
-		NumericID:      numericID,
-		State:          ConsumerWorkerStatusIdle,
-		StartTime:      time.Now(),
-		LastActiveTime: time.Now(),
-		LastIdleTime:   time.Now(),
+	workerID := fmt.Sprintf("consumer-%d", time.Now().UnixNano())
+	consumer := &Consumer{
+		id:       workerID,
+		stopChan: make(chan struct{}),
 	}
 
-	c.statusMu.Lock()
-	c.workerStatus[workerID] = status
-	c.statusMu.Unlock()
+	cg.workers[workerID] = consumer
+	cg.workerCount.Add(1)
 
-	workerCtx, cancel := context.WithCancel(context.Background())
-	go func() {
-		defer cancel()
-		if err := worker.Start(workerCtx); err != nil {
-			if !c.startupDone.Load() {
-				log.Printf("[ConsumerGroup] Worker %s failed during startup: %v", workerID, err)
-				panic(fmt.Sprintf("worker startup failed: %v", err))
-			}
-			log.Printf("[ConsumerGroup] Worker %s failed: %v", workerID, err)
-			c.handleWorkerError(workerID, err)
-		}
-	}()
+	cg.wg.Add(1)
+	go cg.runWorker(consumer)
 
-	c.collector.RecordConsumerAdded(workerID)
-	log.Printf("[ConsumerGroup] Successfully added and started worker %s. Total workers: %d",
-		workerID, len(c.workers))
+	log.Printf("[ConsumerGroup] Started new worker %s. Total workers: %d",
+		workerID, cg.workerCount.Load())
 	return nil
 }
 
-func (c *ConsumerGroup) RemoveWorker() error {
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
+func (cg *ConsumerGroup) runWorker(consumer *Consumer) {
+	defer cg.wg.Done()
+	defer func() {
+		cg.mu.Lock()
+		delete(cg.workers, consumer.id)
+		cg.mu.Unlock()
+		cg.workerCount.Add(-1)
+	}()
 
-	if len(c.workers) <= c.config.MinWorkers {
-		log.Printf("[ConsumerGroup] Cannot remove worker: minimum worker count (%d) reached", c.config.MinWorkers)
-		return fmt.Errorf("minimum worker count reached")
-	}
-
-	var workerToRemove string
-	var longestIdleTime time.Duration
-	now := time.Now()
-
-	c.statusMu.RLock()
-	log.Printf("[ConsumerGroup] Searching for idle worker to remove among %d workers", len(c.workerStatus))
-	for id, status := range c.workerStatus {
-		if status.State == ConsumerWorkerStatusIdle {
-			idleTime := now.Sub(status.LastIdleTime)
-			log.Printf("[ConsumerGroup] Worker %s has been idle for %v", id, idleTime)
-			if idleTime > longestIdleTime {
-				longestIdleTime = idleTime
-				workerToRemove = id
+	for {
+		select {
+		case <-cg.ctx.Done():
+			return
+		case <-consumer.stopChan:
+			return
+		default:
+			if err := cg.pollAndProcess(consumer); err != nil {
+				log.Printf("[Consumer %s] Error polling messages: %v", consumer.id, err)
+				time.Sleep(time.Second) // Backoff on error
 			}
 		}
 	}
-	c.statusMu.RUnlock()
+}
 
-	if workerToRemove == "" {
-		log.Printf("[ConsumerGroup] No idle workers available for removal")
-		return fmt.Errorf("no idle workers available for removal")
+func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
+	consumer.status.Store(consumerStatusPolling)
+	defer consumer.status.Store(consumerStatusIdle)
+
+	// Select queue to poll
+	queue, err := cg.scheduler.SelectQueue()
+	if err != nil {
+		return fmt.Errorf("selecting queue: %w", err)
 	}
-
-	if worker, exists := c.workers[workerToRemove]; exists {
-		log.Printf("[ConsumerGroup] Stopping worker %s", workerToRemove)
-		worker.Stop()
-		delete(c.workers, workerToRemove)
-
-		c.statusMu.Lock()
-		status := c.workerStatus[workerToRemove]
-		delete(c.workerStatus, workerToRemove)
-		c.statusMu.Unlock()
-
-		c.returnWorkerID(status.NumericID)
-		c.collector.RecordConsumerRemoved(workerToRemove)
-		log.Printf("[ConsumerGroup] Successfully removed worker %s. Total workers: %d",
-			workerToRemove, len(c.workers))
+	if queue == nil {
+		time.Sleep(100 * time.Millisecond)
 		return nil
 	}
 
-	return fmt.Errorf("consumer worker not found")
-}
-
-func (c *ConsumerGroup) monitorWorkerStatus(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.updateWorkerMetrics()
-		}
+	// Poll messages
+	result, err := cg.sqsClient.ReceiveMessage(cg.ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:            &queue.URL,
+		MaxNumberOfMessages: int32(cg.config.MaxBatchSize),
+		WaitTimeSeconds:     20,
+		AttributeNames: []types.QueueAttributeName{
+			"ApproximateReceiveCount",
+			"SentTimestamp",
+		},
+		// Add MessageAttributeNames to get any custom attributes
+		MessageAttributeNames: []string{"All"},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to receive messages: %v", err)
 	}
-}
 
-func (c *ConsumerGroup) monitorWorkerHealth(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.checkWorkerHealth()
+	// Process received messages
+	for _, msg := range result.Messages {
+		message := &models.Message{
+			QueueURL:   queue.URL,
+			QueueName:  queue.Name,
+			Priority:   models.Priority(queue.Priority),
+			MessageID:  *msg.MessageId,
+			Body:       []byte(*msg.Body),
+			ReceiptHandle: msg.ReceiptHandle,
+			Size:       int64(len(*msg.Body)),
+			ReceivedAt: time.Now(),
 		}
-	}
-}
 
-func (c *ConsumerGroup) updateWorkerMetrics() {
-	c.workersMu.RLock()
-	defer c.workersMu.RUnlock()
-
-	now := time.Now()
-
-	for id, worker := range c.workers {
-		metrics := worker.GetMetrics()
-
-		c.statusMu.Lock()
-		if status, exists := c.workerStatus[id]; exists {
-			prevState := status.State
-			status.State = metrics.Status
-			status.MessageCount.Store(metrics.MessageCount)
-			status.LastActiveTime = metrics.LastPollTime
-
-			// Update idle time if worker just became idle
-			if prevState != ConsumerWorkerStatusIdle && status.State == ConsumerWorkerStatusIdle {
-				status.LastIdleTime = now
-			}
-		}
-		c.statusMu.Unlock()
-	}
-}
-
-func (c *ConsumerGroup) checkWorkerHealth() {
-	c.statusMu.RLock()
-	defer c.statusMu.RUnlock()
-
-	now := time.Now()
-
-	for id, status := range c.workerStatus {
-		// Check for stuck workers
-		if status.State == ConsumerWorkerStatusPolling &&
-			now.Sub(status.LastActiveTime) > 5*time.Minute {
-			c.replaceWorker(id)
+		if err := cg.buffer.Push(message); err != nil {
+			log.Printf("[Consumer %s] Failed to buffer message %s: %v",
+				consumer.id, message.MessageID, err)
 			continue
 		}
-	}
-}
 
-func (c *ConsumerGroup) handleWorkerError(workerID string, err error) {
-	c.collector.RecordError(workerID, "consumer_worker_error")
-	fmt.Printf("Worker %s encountered an error: %v\n", workerID, err)
-	c.replaceWorker(workerID)
-}
-
-func (c *ConsumerGroup) replaceWorker(workerID string) {
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
-
-	if worker, exists := c.workers[workerID]; exists {
-		worker.Stop()
-
-		c.statusMu.RLock()
-		numericID := c.workerStatus[workerID].NumericID
-		c.statusMu.RUnlock()
-
-		newWorker := NewConsumerWorker(workerID, c.buffer, c.scheduler, c.client, c.collector)
-		c.workers[workerID] = newWorker
-
-		c.statusMu.Lock()
-		c.workerStatus[workerID] = &ConsumerWorkerStatus{
-			ID:             workerID,
-			NumericID:      numericID,
-			State:          ConsumerWorkerStatusIdle,
-			StartTime:      time.Now(),
-			LastActiveTime: time.Now(),
-			LastIdleTime:   time.Now(),
-		}
-		c.statusMu.Unlock()
-
-		go func() {
-			if err := newWorker.Start(context.Background()); err != nil {
-				c.collector.RecordError(workerID, "consumer_worker_error")
-				fmt.Printf("Error starting replacement worker: %v\n", err)
-			}
-		}()
-
-		c.collector.RecordConsumerReplaced(workerID)
-	}
-}
-
-func (c *ConsumerGroup) Shutdown(ctx context.Context) error {
-	log.Printf("[ConsumerGroup] Initiating shutdown sequence")
-	c.shuttingDown.Store(true)
-
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
-
-	workerCount := len(c.workers)
-	log.Printf("[ConsumerGroup] Stopping %d workers", workerCount)
-
-	for id, worker := range c.workers {
-		log.Printf("[ConsumerGroup] Stopping worker %s", id)
-		worker.Stop()
-
-		c.statusMu.Lock()
-		delete(c.workerStatus, id)
-		c.statusMu.Unlock()
+		consumer.msgCount.Add(1)
+		consumer.lastPoll = time.Now()
 	}
 
-	c.workers = make(map[string]*ConsumerWorker)
-	log.Printf("[ConsumerGroup] Shutdown completed successfully")
+	log.Printf("[Consumer %s] Polled %d messages from queue %s and pushed to message buffer", consumer.id, len(result.Messages), queue.Name)
 
 	return nil
+}
+
+func (cg *ConsumerGroup) monitorAndScale() {
+	ticker := time.NewTicker(cg.config.ScaleInterval.Duration)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-cg.ctx.Done():
+			return
+		case <-ticker.C:
+			totalMessages := int64(0)
+			totalInFlight := int64(0)
+			avgProcessingTime := float64(0)
+			activeQueues := 0
+
+			// Calculate metrics across all queues
+			for _, queueConfig := range cg.config.Queues {
+				if metrics := cg.collector.GetQueueMetrics(queueConfig.Name); metrics != nil {
+					totalMessages += metrics.MessageCount
+					totalInFlight += metrics.InFlightCount
+					if metrics.ProcessedCount.Load() > 0 {
+						avgProcessingTime += float64(metrics.ProcessingTime.Load()) / float64(metrics.ProcessedCount.Load())
+						activeQueues++
+					}
+				}
+			}
+
+			if activeQueues > 0 {
+				avgProcessingTime /= float64(activeQueues)
+			}
+
+			currentWorkers := cg.workerCount.Load()
+			desiredWorkers := calculateDesiredWorkers(
+				totalMessages,
+				totalInFlight,
+				avgProcessingTime,
+				cg.config,
+			)
+
+			// Apply scaling decisions
+			if desiredWorkers > int64(currentWorkers) {
+				for i := 0; i < min(int(desiredWorkers-int64(currentWorkers)), 3); i++ {
+					if err := cg.startWorker(); err != nil {
+						log.Printf("[ConsumerGroup] Failed to scale up: %v", err)
+						break
+					}
+				}
+			} else if desiredWorkers < int64(currentWorkers) && currentWorkers > int32(cg.config.MinWorkers) {
+				cg.stopWorker()
+			}
+		}
+	}
+}
+
+func calculateDesiredWorkers(totalMessages, inFlight int64, avgProcessingTime float64, config config.ConsumerConfig) int64 {
+	// Calculate processing capacity needed
+	if totalMessages == 0 && inFlight == 0 {
+		return int64(config.MinWorkers)
+	}
+
+	// Estimate messages per worker per second
+	messagesPerWorkerPerSecond := 1000.0 / max(avgProcessingTime, 100.0)
+
+	// Calculate needed workers based on total workload
+	totalWorkload := float64(totalMessages + inFlight)
+	desiredWorkers := int64(math.Ceil(totalWorkload / (messagesPerWorkerPerSecond * float64(config.ScaleInterval.Seconds()))))
+
+	// Apply boundaries
+	desiredWorkers = max(int64(config.MinWorkers), min(desiredWorkers, int64(config.MaxWorkers)))
+
+	// Add headroom for bursts
+	if totalMessages > 0 {
+		burstFactor := math.Log1p(float64(totalMessages)) / math.Log1p(1000.0)
+		desiredWorkers = int64(float64(desiredWorkers) * (1 + burstFactor*0.2))
+	}
+
+	return desiredWorkers
+}
+
+func (cg *ConsumerGroup) stopWorker() {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+
+	// Find an idle worker to stop
+	for _, worker := range cg.workers {
+		if worker.status.Load() == consumerStatusIdle {
+			close(worker.stopChan)
+			log.Printf("[ConsumerGroup] Stopped worker %s", worker.id)
+			return
+		}
+	}
+}
+
+func (cg *ConsumerGroup) Shutdown(ctx context.Context) error {
+	log.Printf("[ConsumerGroup] Initiating shutdown...")
+	cg.cancelFunc()
+
+	// Stop all workers
+	cg.mu.Lock()
+	for _, worker := range cg.workers {
+		close(worker.stopChan)
+	}
+	cg.mu.Unlock()
+
+	// Wait for workers to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		cg.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		log.Printf("[ConsumerGroup] Shutdown completed")
+		return nil
+	}
 }
