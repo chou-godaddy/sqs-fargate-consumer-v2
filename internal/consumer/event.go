@@ -51,18 +51,15 @@ type EventBuffer struct {
 	lowPriority    chan *Event
 	config         config.BufferConfig
 
-	// Atomic counters for metrics
 	highOverflows   atomic.Int64
 	mediumOverflows atomic.Int64
 	lowOverflows    atomic.Int64
 	totalMemory     atomic.Int64
 
-	// Buffer scaling
 	currentSize   atomic.Int32
 	lastScaleTime time.Time
 	scalingMu     sync.Mutex
 
-	// Monitoring
 	metricsWindow []bufferMetricPoint
 	metricsMu     sync.RWMutex
 }
@@ -111,25 +108,28 @@ func calculateInitialSize(cfg config.BufferConfig, workerCount int) int {
 }
 
 func (eb *EventBuffer) Push(event *Event) error {
-	// Set enqueue time for latency tracking
 	event.EnqueuedAt = time.Now()
 
-	// Check message size limits
 	if event.Size > eb.config.MaxMessageSize {
+		log.Printf("[Buffer] Rejected message %s: exceeds size limit of %d bytes",
+			*event.Message.MessageId, eb.config.MaxMessageSize)
 		return fmt.Errorf("message exceeds size limit")
 	}
 
-	// Check memory limits
 	if eb.totalMemory.Load()+event.Size > eb.config.MemoryLimit {
+		log.Printf("[Buffer] Rejected message %s: would exceed memory limit of %d bytes",
+			*event.Message.MessageId, eb.config.MemoryLimit)
 		return fmt.Errorf("buffer memory limit exceeded")
 	}
 
-	// Try to push to appropriate priority channel
 	var err error
+	pushed := false
+
 	switch event.Priority {
 	case PriorityHigh:
 		select {
 		case eb.highPriority <- event:
+			pushed = true
 			eb.totalMemory.Add(event.Size)
 		default:
 			eb.highOverflows.Add(1)
@@ -138,6 +138,7 @@ func (eb *EventBuffer) Push(event *Event) error {
 	case PriorityMedium:
 		select {
 		case eb.mediumPriority <- event:
+			pushed = true
 			eb.totalMemory.Add(event.Size)
 		default:
 			eb.mediumOverflows.Add(1)
@@ -146,6 +147,7 @@ func (eb *EventBuffer) Push(event *Event) error {
 	case PriorityLow:
 		select {
 		case eb.lowPriority <- event:
+			pushed = true
 			eb.totalMemory.Add(event.Size)
 		default:
 			eb.lowOverflows.Add(1)
@@ -153,10 +155,15 @@ func (eb *EventBuffer) Push(event *Event) error {
 		}
 	}
 
-	// Record metrics
+	if pushed {
+		log.Printf("[Buffer] Pushed message %s to %s priority buffer. Size: %d bytes",
+			*event.Message.MessageId, getPriorityString(event.Priority), event.Size)
+	} else {
+		log.Printf("[Buffer] Failed to push message %s: %v", *event.Message.MessageId, err)
+	}
+
 	eb.recordMetrics()
 
-	// Check if buffer needs to be scaled
 	if err != nil && eb.shouldScale() {
 		eb.scaleBuffer()
 	}
@@ -165,37 +172,40 @@ func (eb *EventBuffer) Push(event *Event) error {
 }
 
 func (eb *EventBuffer) Pop(ctx context.Context) (*Event, error) {
-	// Try all priority levels in order
-	for _, ch := range []struct {
-		channel chan *Event
-		wait    bool
-	}{
-		{eb.highPriority, false},
-		{eb.mediumPriority, false},
-		{eb.lowPriority, true}, // Only wait on lowest priority
-	} {
-		if ch.wait {
-			select {
-			case event := <-ch.channel:
-				eb.totalMemory.Add(-event.Size)
-				eb.recordMetrics()
-				return event, nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		} else {
-			select {
-			case event := <-ch.channel:
-				eb.totalMemory.Add(-event.Size)
-				eb.recordMetrics()
-				return event, nil
-			default:
-				continue
-			}
-		}
+	var event *Event
+
+	// Try high priority first
+	select {
+	case event = <-eb.highPriority:
+		log.Printf("[Buffer] Popped high priority message %s", *event.Message.MessageId)
+		eb.totalMemory.Add(-event.Size)
+		eb.recordMetrics()
+		return event, nil
+	default:
 	}
 
-	return nil, nil
+	// Try medium priority
+	select {
+	case event = <-eb.mediumPriority:
+		log.Printf("[Buffer] Popped medium priority message %s", *event.Message.MessageId)
+		eb.totalMemory.Add(-event.Size)
+		eb.recordMetrics()
+		return event, nil
+	default:
+	}
+
+	// Try low priority with context timeout
+	select {
+	case event = <-eb.lowPriority:
+		log.Printf("[Buffer] Popped low priority message %s", *event.Message.MessageId)
+		eb.totalMemory.Add(-event.Size)
+		eb.recordMetrics()
+		return event, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(100 * time.Millisecond):
+		return nil, nil
+	}
 }
 
 func (eb *EventBuffer) shouldScale() bool {
@@ -228,38 +238,37 @@ func (eb *EventBuffer) scaleBuffer() {
 	currentSize := eb.currentSize.Load()
 	newSize := int32(float64(currentSize) * eb.config.ScaleIncrement)
 
-	// Check maximum size limit
 	if newSize > int32(eb.config.MaxSize) {
 		newSize = int32(eb.config.MaxSize)
 	}
 
-	// Only scale if there's an actual increase
 	if newSize <= currentSize {
 		return
 	}
 
-	// Calculate new channel sizes
 	highSize := int(float64(newSize) * eb.config.HighPriorityPercent)
 	medSize := int(float64(newSize) * eb.config.MediumPriorityPercent)
 	lowSize := int(float64(newSize) * eb.config.LowPriorityPercent)
 
-	// Create new channels
+	log.Printf("[Buffer] Scaling from %d to %d total capacity (High: %d, Medium: %d, Low: %d)",
+		currentSize, newSize, highSize, medSize, lowSize)
+
 	newHigh := make(chan *Event, highSize)
 	newMed := make(chan *Event, medSize)
 	newLow := make(chan *Event, lowSize)
 
-	// Transfer existing messages
 	eb.transferMessages(eb.highPriority, newHigh)
 	eb.transferMessages(eb.mediumPriority, newMed)
 	eb.transferMessages(eb.lowPriority, newLow)
 
-	// Update channels
 	eb.highPriority = newHigh
 	eb.mediumPriority = newMed
 	eb.lowPriority = newLow
 
 	eb.currentSize.Store(newSize)
 	eb.lastScaleTime = time.Now()
+
+	log.Printf("[Buffer] Scaling complete. New total capacity: %d", newSize)
 }
 
 func (eb *EventBuffer) transferMessages(old, new chan *Event) {
@@ -383,4 +392,17 @@ func (eb *EventBuffer) Reset() {
 	eb.metricsMu.Lock()
 	eb.metricsWindow = make([]bufferMetricPoint, 0, 1000)
 	eb.metricsMu.Unlock()
+}
+
+func getPriorityString(p Priority) string {
+	switch p {
+	case PriorityHigh:
+		return "high"
+	case PriorityMedium:
+		return "medium"
+	case PriorityLow:
+		return "low"
+	default:
+		return "unknown"
+	}
 }

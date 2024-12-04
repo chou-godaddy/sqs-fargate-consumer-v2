@@ -22,7 +22,7 @@ type ConsumerGroup struct {
 	buffer    *EventBuffer
 	collector *metrics.Collector
 
-	workers   map[string]*Worker
+	workers   map[string]*ConsumerWorker
 	workersMu sync.RWMutex
 
 	// Worker ID management
@@ -31,7 +31,7 @@ type ConsumerGroup struct {
 	idPoolMu     sync.Mutex
 
 	// Worker status tracking
-	workerStatus map[string]*WorkerStatus
+	workerStatus map[string]*ConsumerWorkerStatus
 	statusMu     sync.RWMutex
 
 	// Coordination
@@ -39,7 +39,7 @@ type ConsumerGroup struct {
 	startupDone  atomic.Bool
 }
 
-type WorkerStatus struct {
+type ConsumerWorkerStatus struct {
 	ID             string
 	NumericID      int32
 	State          int32 // 0: idle, 1: polling, 2: stopped
@@ -55,31 +55,35 @@ func NewConsumer(cfg *config.ConsumerGroupConfig, client *sqs.Client, collector 
 		client:       client,
 		buffer:       buffer,
 		collector:    collector,
-		workers:      make(map[string]*Worker),
-		workerStatus: make(map[string]*WorkerStatus),
+		workers:      make(map[string]*ConsumerWorker),
+		workerStatus: make(map[string]*ConsumerWorkerStatus),
 		scheduler:    scheduler.NewScheduler(cfg.Queues, collector),
 	}
 }
 
 func (c *ConsumerGroup) Start(ctx context.Context) error {
-	// Initialize worker ID pool with sequential IDs
+	log.Printf("[ConsumerGroup] Starting consumer group with configuration - Min workers: %d, Max workers: %d",
+		c.config.MinWorkers, c.config.MaxWorkers)
+
+	// Initialize worker ID pool
 	for i := int32(0); i < int32(c.config.MinWorkers); i++ {
 		c.workerIDs = append(c.workerIDs, i)
 	}
 	sort.Slice(c.workerIDs, func(i, j int) bool {
 		return c.workerIDs[i] < c.workerIDs[j]
 	})
+	log.Printf("[ConsumerGroup] Initialized worker ID pool with %d IDs", len(c.workerIDs))
 
 	// Start initial workers
 	for i := 0; i < c.config.MinWorkers; i++ {
 		if err := c.AddWorker(); err != nil {
-			// Critical failure during initialization
+			log.Printf("[ConsumerGroup] Fatal error starting initial workers: %v", err)
 			return fmt.Errorf("fatal error starting initial workers: %w", err)
 		}
 	}
 
 	c.startupDone.Store(true)
-	log.Printf("Consumer group started with %d workers\n", c.config.MinWorkers)
+	log.Printf("[ConsumerGroup] Successfully started with %d workers", c.config.MinWorkers)
 
 	// Start monitoring routines
 	go c.monitorWorkerStatus(ctx)
@@ -116,21 +120,22 @@ func (c *ConsumerGroup) AddWorker() error {
 	defer c.workersMu.Unlock()
 
 	if len(c.workers) >= c.config.MaxWorkers {
+		log.Printf("[ConsumerGroup] Cannot add worker: maximum worker count (%d) reached", c.config.MaxWorkers)
 		return fmt.Errorf("maximum worker count reached")
 	}
 
 	numericID := c.getNextWorkerID()
-	workerID := fmt.Sprintf("worker-%d", numericID)
+	workerID := fmt.Sprintf("consumer-worker-%d", numericID)
 
-	// Create new worker
-	worker := NewWorker(workerID, c.buffer, c.scheduler, c.client, c.collector)
+	log.Printf("[ConsumerGroup] Creating new worker with ID: %s", workerID)
+
+	worker := NewConsumerWorker(workerID, c.buffer, c.scheduler, c.client, c.collector)
 	c.workers[workerID] = worker
 
-	// Initialize worker status
-	status := &WorkerStatus{
+	status := &ConsumerWorkerStatus{
 		ID:             workerID,
 		NumericID:      numericID,
-		State:          WorkerStatusIdle,
+		State:          ConsumerWorkerStatusIdle,
 		StartTime:      time.Now(),
 		LastActiveTime: time.Now(),
 		LastIdleTime:   time.Now(),
@@ -140,21 +145,22 @@ func (c *ConsumerGroup) AddWorker() error {
 	c.workerStatus[workerID] = status
 	c.statusMu.Unlock()
 
-	// Start worker
 	workerCtx, cancel := context.WithCancel(context.Background())
 	go func() {
 		defer cancel()
 		if err := worker.Start(workerCtx); err != nil {
 			if !c.startupDone.Load() {
-				// During startup, propagate error to main thread
+				log.Printf("[ConsumerGroup] Worker %s failed during startup: %v", workerID, err)
 				panic(fmt.Sprintf("worker startup failed: %v", err))
 			}
-			log.Printf("Worker %s failed to start with an error: %v\n", workerID, err)
+			log.Printf("[ConsumerGroup] Worker %s failed: %v", workerID, err)
 			c.handleWorkerError(workerID, err)
 		}
 	}()
 
-	c.collector.RecordWorkerAdded(workerID)
+	c.collector.RecordConsumerAdded(workerID)
+	log.Printf("[ConsumerGroup] Successfully added and started worker %s. Total workers: %d",
+		workerID, len(c.workers))
 	return nil
 }
 
@@ -163,18 +169,20 @@ func (c *ConsumerGroup) RemoveWorker() error {
 	defer c.workersMu.Unlock()
 
 	if len(c.workers) <= c.config.MinWorkers {
+		log.Printf("[ConsumerGroup] Cannot remove worker: minimum worker count (%d) reached", c.config.MinWorkers)
 		return fmt.Errorf("minimum worker count reached")
 	}
 
-	// Find the most idle worker to remove
 	var workerToRemove string
 	var longestIdleTime time.Duration
 	now := time.Now()
 
 	c.statusMu.RLock()
+	log.Printf("[ConsumerGroup] Searching for idle worker to remove among %d workers", len(c.workerStatus))
 	for id, status := range c.workerStatus {
-		if status.State == WorkerStatusIdle {
+		if status.State == ConsumerWorkerStatusIdle {
 			idleTime := now.Sub(status.LastIdleTime)
+			log.Printf("[ConsumerGroup] Worker %s has been idle for %v", id, idleTime)
 			if idleTime > longestIdleTime {
 				longestIdleTime = idleTime
 				workerToRemove = id
@@ -184,11 +192,12 @@ func (c *ConsumerGroup) RemoveWorker() error {
 	c.statusMu.RUnlock()
 
 	if workerToRemove == "" {
-		// If no idle worker found, don't remove any
+		log.Printf("[ConsumerGroup] No idle workers available for removal")
 		return fmt.Errorf("no idle workers available for removal")
 	}
 
 	if worker, exists := c.workers[workerToRemove]; exists {
+		log.Printf("[ConsumerGroup] Stopping worker %s", workerToRemove)
 		worker.Stop()
 		delete(c.workers, workerToRemove)
 
@@ -198,11 +207,13 @@ func (c *ConsumerGroup) RemoveWorker() error {
 		c.statusMu.Unlock()
 
 		c.returnWorkerID(status.NumericID)
-		c.collector.RecordWorkerRemoved(workerToRemove)
+		c.collector.RecordConsumerRemoved(workerToRemove)
+		log.Printf("[ConsumerGroup] Successfully removed worker %s. Total workers: %d",
+			workerToRemove, len(c.workers))
 		return nil
 	}
 
-	return fmt.Errorf("worker not found")
+	return fmt.Errorf("consumer worker not found")
 }
 
 func (c *ConsumerGroup) monitorWorkerStatus(ctx context.Context) {
@@ -250,7 +261,7 @@ func (c *ConsumerGroup) updateWorkerMetrics() {
 			status.LastActiveTime = metrics.LastPollTime
 
 			// Update idle time if worker just became idle
-			if prevState != WorkerStatusIdle && status.State == WorkerStatusIdle {
+			if prevState != ConsumerWorkerStatusIdle && status.State == ConsumerWorkerStatusIdle {
 				status.LastIdleTime = now
 			}
 		}
@@ -266,7 +277,7 @@ func (c *ConsumerGroup) checkWorkerHealth() {
 
 	for id, status := range c.workerStatus {
 		// Check for stuck workers
-		if status.State == WorkerStatusPolling &&
+		if status.State == ConsumerWorkerStatusPolling &&
 			now.Sub(status.LastActiveTime) > 5*time.Minute {
 			c.replaceWorker(id)
 			continue
@@ -275,7 +286,7 @@ func (c *ConsumerGroup) checkWorkerHealth() {
 }
 
 func (c *ConsumerGroup) handleWorkerError(workerID string, err error) {
-	c.collector.RecordError(workerID, "worker_error")
+	c.collector.RecordError(workerID, "consumer_worker_error")
 	fmt.Printf("Worker %s encountered an error: %v\n", workerID, err)
 	c.replaceWorker(workerID)
 }
@@ -291,14 +302,14 @@ func (c *ConsumerGroup) replaceWorker(workerID string) {
 		numericID := c.workerStatus[workerID].NumericID
 		c.statusMu.RUnlock()
 
-		newWorker := NewWorker(workerID, c.buffer, c.scheduler, c.client, c.collector)
+		newWorker := NewConsumerWorker(workerID, c.buffer, c.scheduler, c.client, c.collector)
 		c.workers[workerID] = newWorker
 
 		c.statusMu.Lock()
-		c.workerStatus[workerID] = &WorkerStatus{
+		c.workerStatus[workerID] = &ConsumerWorkerStatus{
 			ID:             workerID,
 			NumericID:      numericID,
-			State:          WorkerStatusIdle,
+			State:          ConsumerWorkerStatusIdle,
 			StartTime:      time.Now(),
 			LastActiveTime: time.Now(),
 			LastIdleTime:   time.Now(),
@@ -307,22 +318,27 @@ func (c *ConsumerGroup) replaceWorker(workerID string) {
 
 		go func() {
 			if err := newWorker.Start(context.Background()); err != nil {
-				c.collector.RecordError(workerID, "worker_error")
+				c.collector.RecordError(workerID, "consumer_worker_error")
 				fmt.Printf("Error starting replacement worker: %v\n", err)
 			}
 		}()
 
-		c.collector.RecordWorkerReplaced(workerID)
+		c.collector.RecordConsumerReplaced(workerID)
 	}
 }
 
 func (c *ConsumerGroup) Shutdown(ctx context.Context) error {
+	log.Printf("[ConsumerGroup] Initiating shutdown sequence")
 	c.shuttingDown.Store(true)
 
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
+	workerCount := len(c.workers)
+	log.Printf("[ConsumerGroup] Stopping %d workers", workerCount)
+
 	for id, worker := range c.workers {
+		log.Printf("[ConsumerGroup] Stopping worker %s", id)
 		worker.Stop()
 
 		c.statusMu.Lock()
@@ -330,7 +346,8 @@ func (c *ConsumerGroup) Shutdown(ctx context.Context) error {
 		c.statusMu.Unlock()
 	}
 
-	c.workers = make(map[string]*Worker)
+	c.workers = make(map[string]*ConsumerWorker)
+	log.Printf("[ConsumerGroup] Shutdown completed successfully")
 
 	return nil
 }

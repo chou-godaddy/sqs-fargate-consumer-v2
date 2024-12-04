@@ -51,7 +51,7 @@ func main() {
 	}
 
 	// Create metrics collector
-	collector := metrics.NewCollector(dep.CloudwatchClient, &cfg.MetricsConfig)
+	collector := metrics.NewCollector(dep.CloudwatchClient, dep.SQSClient, &cfg.MetricsConfig, cfg.ConsumerGroupConfig.Queues)
 
 	// Create event buffer
 	buffer := consumer.NewEventBuffer(cfg.BufferConfig, cfg.ConsumerGroupConfig.MinWorkers)

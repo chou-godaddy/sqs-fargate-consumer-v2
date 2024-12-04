@@ -14,19 +14,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
-type Worker struct {
+type ConsumerWorker struct {
 	id              string
 	buffer          *EventBuffer
 	scheduler       *scheduler.Scheduler
 	sqsClient       *sqs.Client
 	collector       *metrics.Collector
-	status          atomic.Int32 // 0: idle, 1: polling, 2: stopped
+	status          atomic.Int32
 	lastPollTime    time.Time
 	messageCount    atomic.Int64
 	processingCount atomic.Int32
 }
 
-type WorkerMetrics struct {
+type ConsumerWorkerMetrics struct {
 	ID           string
 	Status       int32
 	MessageCount int64
@@ -34,13 +34,13 @@ type WorkerMetrics struct {
 }
 
 const (
-	WorkerStatusIdle    int32 = 0
-	WorkerStatusPolling int32 = 1
-	WorkerStatusStopped int32 = 2
+	ConsumerWorkerStatusIdle    int32 = 0
+	ConsumerWorkerStatusPolling int32 = 1
+	ConsumerWorkerStatusStopped int32 = 2
 )
 
-func NewWorker(id string, buffer *EventBuffer, scheduler *scheduler.Scheduler, sqsClient *sqs.Client, collector *metrics.Collector) *Worker {
-	return &Worker{
+func NewConsumerWorker(id string, buffer *EventBuffer, scheduler *scheduler.Scheduler, sqsClient *sqs.Client, collector *metrics.Collector) *ConsumerWorker {
+	return &ConsumerWorker{
 		id:        id,
 		buffer:    buffer,
 		scheduler: scheduler,
@@ -49,27 +49,28 @@ func NewWorker(id string, buffer *EventBuffer, scheduler *scheduler.Scheduler, s
 	}
 }
 
-func (w *Worker) Start(ctx context.Context) error {
+func (w *ConsumerWorker) Start(ctx context.Context) error {
+	log.Printf("[ConsumerWorker %s] Starting worker", w.id)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			if w.status.Load() == WorkerStatusStopped {
+			if w.status.Load() == ConsumerWorkerStatusStopped {
+				log.Printf("[ConsumerWorker %s] Stopped", w.id)
 				return nil
 			}
 
-			// Check if we should poll based on buffer capacity
 			if !w.shouldPoll() {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
-			// Get queue to poll from scheduler
 			queue, err := w.scheduler.SelectQueue()
 			if err != nil {
 				w.collector.RecordError("", "select_queue_error")
-				fmt.Printf("Error selecting queue: %v", err)
+				log.Printf("[ConsumerWorker %s] Error selecting queue: %v", w.id, err)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -78,27 +79,28 @@ func (w *Worker) Start(ctx context.Context) error {
 				continue
 			}
 
-			// Calculate how many messages we can safely poll
 			maxMessages := w.calculateMaxMessages()
 			if maxMessages <= 0 {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
-			log.Printf("Worker %s polling %d messages from queue %s", w.id, maxMessages, queue.Name)
+			log.Printf("[ConsumerWorker %s] Polling %d messages from queue %s", w.id, maxMessages, queue.Name)
 
-			w.status.Store(WorkerStatusPolling)
+			w.status.Store(ConsumerWorkerStatusPolling)
 			messages, err := w.pollMessages(ctx, queue, maxMessages)
-			w.status.Store(WorkerStatusIdle)
-
+			w.status.Store(ConsumerWorkerStatusIdle)
 			if err != nil {
 				w.collector.RecordError(queue.Name, "poll_error")
-				log.Printf("Worker %s encountered an error polling queue %s: %v", w.id, queue.Name, err)
-				time.Sleep(time.Second) // Backoff on error
+				log.Printf("[ConsumerWorker %s] Error polling queue %s: %v", w.id, queue.Name, err)
+				time.Sleep(time.Second)
 				continue
 			}
 
+			log.Printf("[ConsumerWorker %s] Successfully polled %d messages from queue %s", w.id, len(messages), queue.Name)
+
 			// Process received messages
+			successful := 0
 			for _, msg := range messages {
 				event := &Event{
 					QueueURL:   queue.URL,
@@ -109,42 +111,53 @@ func (w *Worker) Start(ctx context.Context) error {
 					Size:       int64(len(*msg.Body)),
 				}
 
-				// Try to push to buffer, stop polling if buffer is full
 				if err := w.buffer.Push(event); err != nil {
-					log.Printf("Worker %s polled %d messages from queue %s but buffer is full", w.id, len(messages), queue.Name)
-					w.collector.RecordError(queue.Name, "buffer_full")
+					log.Printf("[ConsumerWorker %s] Failed to push message to buffer: %v", w.id, err)
+					w.collector.RecordError(queue.Name, "buffer_push_error")
 					break
 				}
 
+				successful++
 				w.messageCount.Add(1)
+				w.collector.RecordProcessingStarted(queue.Name, int(event.Priority))
+
+				log.Printf("[ConsumerWorker %s] Successfully pushed message %s to buffer. Total messages processed: %d",
+					w.id, *msg.MessageId, w.messageCount.Load())
 			}
 
-			log.Printf("Worker %s polled %d messages from queue %s and pushed to buffer channel", w.id, len(messages), queue.Name)
+			if successful > 0 {
+				log.Printf("[ConsumerWorker %s] Successfully processed batch of %d/%d messages from queue %s",
+					w.id, successful, len(messages), queue.Name)
+			}
 
 			w.lastPollTime = time.Now()
+
+			// Add a small delay between polls to prevent tight loops
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
-func (w *Worker) shouldPoll() bool {
+func (w *ConsumerWorker) shouldPoll() bool {
 	metrics := w.buffer.GetMetrics()
 
-	// Don't poll if buffer utilization is too high
-	if metrics.HighPriorityUtilization > 0.9 ||
-		metrics.MediumPriorityUtilization > 0.9 ||
-		metrics.LowPriorityUtilization > 0.9 {
+	// Check buffer utilization
+	if metrics.GetAverageUtilization() > 0.9 {
+		log.Printf("[ConsumerWorker %s] Skipping poll due to high buffer utilization (%.2f%%)",
+			w.id, metrics.GetAverageUtilization()*100)
 		return false
 	}
 
-	// Don't poll if memory usage is too high
+	// Check memory usage
 	if metrics.TotalMemoryUsage > (w.buffer.config.MemoryLimit * 90 / 100) {
+		log.Printf("[ConsumerWorker %s] Skipping poll due to high memory usage (%d/%d bytes)",
+			w.id, metrics.TotalMemoryUsage, w.buffer.config.MemoryLimit)
 		return false
 	}
 
 	return true
 }
-
-func (w *Worker) calculateMaxMessages() int32 {
+func (w *ConsumerWorker) calculateMaxMessages() int32 {
 	metrics := w.buffer.GetMetrics()
 
 	// Calculate available capacity in each priority level
@@ -167,11 +180,11 @@ func (w *Worker) calculateMaxMessages() int32 {
 	return min(maxMessages, 10)
 }
 
-func (w *Worker) pollMessages(ctx context.Context, queue *config.QueueConfig, maxMessages int32) ([]types.Message, error) {
+func (w *ConsumerWorker) pollMessages(ctx context.Context, queue *config.QueueConfig, maxMessages int32) ([]types.Message, error) {
 	input := &sqs.ReceiveMessageInput{
 		QueueUrl:            &queue.URL,
 		MaxNumberOfMessages: maxMessages,
-		WaitTimeSeconds:     20, // Long polling
+		WaitTimeSeconds:     20,
 		AttributeNames: []types.QueueAttributeName{
 			"ApproximateReceiveCount",
 			"SentTimestamp",
@@ -179,24 +192,30 @@ func (w *Worker) pollMessages(ctx context.Context, queue *config.QueueConfig, ma
 		MessageAttributeNames: []string{"All"},
 	}
 
+	log.Printf("[ConsumerWorker %s] Starting long poll on queue %s for max %d messages",
+		w.id, queue.Name, maxMessages)
+
 	result, err := w.sqsClient.ReceiveMessage(ctx, input)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("receive message error: %w", err)
 	}
+
+	log.Printf("[ConsumerWorker %s] Received %d messages from queue %s",
+		w.id, len(result.Messages), queue.Name)
 
 	return result.Messages, nil
 }
 
-func (w *Worker) Stop() {
-	w.status.Store(WorkerStatusStopped)
+func (w *ConsumerWorker) Stop() {
+	w.status.Store(ConsumerWorkerStatusStopped)
 }
 
-func (w *Worker) IsPolling() bool {
-	return w.status.Load() == WorkerStatusPolling
+func (w *ConsumerWorker) IsPolling() bool {
+	return w.status.Load() == ConsumerWorkerStatusPolling
 }
 
-func (w *Worker) GetMetrics() WorkerMetrics {
-	return WorkerMetrics{
+func (w *ConsumerWorker) GetMetrics() ConsumerWorkerMetrics {
+	return ConsumerWorkerMetrics{
 		ID:           w.id,
 		Status:       w.status.Load(),
 		MessageCount: w.messageCount.Load(),

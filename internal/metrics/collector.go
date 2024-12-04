@@ -3,6 +3,8 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -11,6 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type MetricType string
@@ -21,13 +25,14 @@ const (
 	MetricMessagesProcessed MetricType = "MessagesProcessed"
 	MetricProcessingTime    MetricType = "ProcessingTime"
 	MetricProcessingErrors  MetricType = "ProcessingErrors"
-	MetricWorkerCount       MetricType = "WorkerCount"
+	MetricConsumerCount     MetricType = "ConsumerCount"
 	MetricBufferUtilization MetricType = "BufferUtilization"
 	MetricQueueDepth        MetricType = "QueueDepth"
-	MetricWorkerAdditions   MetricType = "WorkerAdditions"
-	MetricWorkerRemovals    MetricType = "WorkerRemovals"
+	MetricConsumerAdditions MetricType = "ConsumerAdditions"
+	MetricConsumerRemovals  MetricType = "ConsumerRemovals"
 	MetricMemoryUsage       MetricType = "MemoryUsage"
 	MetricCPUUsage          MetricType = "CPUUsage"
+	MetricsInFlightMessages MetricType = "InFlightMessages"
 )
 
 const (
@@ -52,12 +57,15 @@ type MetricSeries struct {
 type Collector struct {
 	client  *cloudwatch.Client
 	config  *config.MetricsConfig
+	sqs     *sqs.Client
 	metrics map[string]map[MetricType]*MetricSeries
 	mu      sync.RWMutex
 	done    chan struct{}
 
-	// Metric metadata
 	metricUnits map[MetricType]MetricUnit
+
+	queues   map[string]string // map[QueueName]QueueURL
+	queuesMu sync.RWMutex
 }
 
 type QueueMetrics struct {
@@ -83,56 +91,142 @@ func (b *BufferMetrics) GetAverageUtilization() float64 {
 		b.LowPriorityUtilization) / 3.0
 }
 
-func NewCollector(client *cloudwatch.Client, config *config.MetricsConfig) *Collector {
-	units := map[MetricType]MetricUnit{
+func NewCollector(cloudwatchClient *cloudwatch.Client, sqsClient *sqs.Client, metricsConfig *config.MetricsConfig, queues []config.QueueConfig) *Collector {
+	// Initialize metric units map first
+	metricUnits := map[MetricType]MetricUnit{
 		MetricMessagesReceived:  UnitCount,
 		MetricMessagesProcessed: UnitCount,
 		MetricProcessingTime:    UnitMilliseconds,
 		MetricProcessingErrors:  UnitCount,
-		MetricWorkerCount:       UnitCount,
+		MetricConsumerCount:     UnitCount,
 		MetricBufferUtilization: UnitPercent,
 		MetricQueueDepth:        UnitCount,
-		MetricWorkerAdditions:   UnitCount,
-		MetricWorkerRemovals:    UnitCount,
+		MetricsInFlightMessages: UnitCount,
 		MetricMemoryUsage:       UnitBytes,
 		MetricCPUUsage:          UnitPercent,
 	}
 
+	queueMap := make(map[string]string, len(queues))
+	metricsMap := make(map[string]map[MetricType]*MetricSeries)
+
+	// Initialize maps for each queue
+	for _, q := range queues {
+		queueMap[q.Name] = q.URL
+		metricsMap[q.Name] = make(map[MetricType]*MetricSeries)
+		log.Printf("[Metrics] Mapped queue %s to URL %s", q.Name, q.URL)
+	}
+
 	return &Collector{
-		client:      client,
-		config:      config,
-		metrics:     make(map[string]map[MetricType]*MetricSeries),
-		metricUnits: units,
+		client:      cloudwatchClient,
+		sqs:         sqsClient,
+		config:      metricsConfig,
+		metrics:     metricsMap,
+		queues:      queueMap,
+		metricUnits: metricUnits,
 		done:        make(chan struct{}),
 	}
 }
 
 func (c *Collector) Start(ctx context.Context) error {
-	// Start metrics cleanup routine
-	go c.cleanupRoutine(ctx)
+	log.Printf("[Metrics] Starting collector with %d registered queues", len(c.queues))
 
-	go func() {
-		// Start metrics publishing routine
-		publishTicker := time.NewTicker(c.config.PublishInterval.Duration)
-		defer publishTicker.Stop()
+	// Start metrics collection routines
+	go c.collectSQSMetrics(ctx)
+	go c.publish(ctx)
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-c.done:
-				return
-			case <-publishTicker.C:
-				if err := c.publish(ctx); err != nil {
-					// Log error but continue collecting
-					fmt.Printf("Error publishing metrics: %v\n", err)
-					continue
-				}
-			}
-		}
-	}()
+	// Perform initial metrics collection
+	c.updateSQSMetrics(ctx)
 
 	return nil
+}
+
+func (c *Collector) collectSQSMetrics(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.updateSQSMetrics(ctx)
+		}
+	}
+}
+
+func (c *Collector) updateSQSMetrics(ctx context.Context) {
+	c.queuesMu.RLock()
+	queueURLs := make(map[string]string, len(c.queues))
+	for name, url := range c.queues {
+		queueURLs[name] = url
+	}
+	c.queuesMu.RUnlock()
+
+	log.Printf("[Metrics] Starting metrics collection for %d queues", len(queueURLs))
+
+	for queueName, queueURL := range queueURLs {
+		input := &sqs.GetQueueAttributesInput{
+			QueueUrl: aws.String(queueURL),
+			AttributeNames: []sqstypes.QueueAttributeName{
+				sqstypes.QueueAttributeNameApproximateNumberOfMessages,
+				sqstypes.QueueAttributeNameApproximateNumberOfMessagesNotVisible,
+			},
+		}
+
+		result, err := c.sqs.GetQueueAttributes(ctx, input)
+		if err != nil {
+			log.Printf("[Metrics] Error getting attributes for queue %s (%s): %v", queueName, queueURL, err)
+			continue
+		}
+
+		messageBacklog, _ := strconv.Atoi(result.Attributes[string(sqstypes.QueueAttributeNameApproximateNumberOfMessages)])
+		inFlightMessages, _ := strconv.Atoi(result.Attributes[string(sqstypes.QueueAttributeNameApproximateNumberOfMessagesNotVisible)])
+
+		c.mu.Lock()
+		if c.metrics[queueName] == nil {
+			c.metrics[queueName] = make(map[MetricType]*MetricSeries)
+		}
+
+		// Update queue metrics
+		c.recordMetricLocked(queueName, MetricQueueDepth, float64(messageBacklog))
+		c.recordMetricLocked(queueName, "InFlightMessages", float64(inFlightMessages))
+		c.mu.Unlock()
+
+		log.Printf("[Metrics] Queue %s - Backlog: %d, In Flight: %d",
+			queueName, messageBacklog, inFlightMessages)
+	}
+}
+
+func (c *Collector) recordMetricLocked(queueName string, metricType MetricType, value float64) {
+	if c.metrics[queueName] == nil {
+		c.metrics[queueName] = make(map[MetricType]*MetricSeries)
+	}
+
+	unit, exists := c.metricUnits[metricType]
+	if !exists {
+		unit = UnitCount // Default to Count if unit not specified
+		log.Printf("[Metrics] Warning: No unit defined for metric type %s, using Count", metricType)
+	}
+
+	if c.metrics[queueName][metricType] == nil {
+		c.metrics[queueName][metricType] = &MetricSeries{
+			Points: make([]MetricDataPoint, 0, c.config.MaxDataPoints),
+		}
+	}
+
+	point := MetricDataPoint{
+		Value:     value,
+		Timestamp: time.Now(),
+		Unit:      unit,
+	}
+
+	series := c.metrics[queueName][metricType]
+	series.Points = append(series.Points, point)
+	series.LastWrite = time.Now()
+
+	log.Printf("[Metrics] Recorded %s = %.2f for queue %s", metricType, value, queueName)
 }
 
 func (c *Collector) cleanupRoutine(ctx context.Context) {
@@ -208,15 +302,14 @@ func (c *Collector) cleanup() {
 
 func (c *Collector) RecordMetric(queueName string, metricType MetricType, value float64) {
 	if c == nil || c.metrics == nil {
-		return // Skip if collector is nil
+		return
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Validate metric type
 	if _, exists := c.metricUnits[metricType]; !exists {
-		return // Skip invalid metric types
+		return
 	}
 
 	normalizedName := c.normalizeQueueName(queueName)
@@ -238,7 +331,8 @@ func (c *Collector) RecordMetric(queueName string, metricType MetricType, value 
 	})
 	series.LastWrite = time.Now()
 
-	// Trim if exceeding max points
+	log.Printf("[Metrics] Recorded %s = %.2f for queue %s", metricType, value, queueName)
+
 	if len(series.Points) > c.config.MaxDataPoints {
 		series.Points = series.Points[1:]
 	}
@@ -257,26 +351,31 @@ func (c *Collector) RecordError(queueName string, errorType string) {
 	c.RecordMetric(queueName, MetricProcessingErrors, 1)
 }
 
-func (c *Collector) RecordWorkerAdded(workerID string) {
+func (c *Collector) RecordConsumerAdded(consumerID string) {
+	log.Printf("[Metrics] Recording new consumer addition: %s", consumerID)
 	normalizedName := c.normalizeQueueName("")
-	c.RecordMetric(normalizedName, MetricWorkerAdditions, 1)
-	c.RecordMetric(normalizedName, MetricWorkerCount, float64(c.getWorkerCount()+1))
+	c.RecordMetric(normalizedName, MetricConsumerAdditions, 1)
+	currentCount := float64(c.getConsumerCount() + 1)
+	c.RecordMetric(normalizedName, MetricConsumerCount, currentCount)
 }
 
-func (c *Collector) RecordWorkerRemoved(workerID string) {
+func (c *Collector) RecordConsumerRemoved(consumerID string) {
+	log.Printf("[Metrics] Recording consumer removal: %s", consumerID)
 	normalizedName := c.normalizeQueueName("")
-	c.RecordMetric(normalizedName, MetricWorkerRemovals, 1)
-	c.RecordMetric(normalizedName, MetricWorkerCount, float64(c.getWorkerCount()-1))
+	c.RecordMetric(normalizedName, MetricConsumerRemovals, 1)
+	currentCount := float64(c.getConsumerCount() - 1)
+	c.RecordMetric(normalizedName, MetricConsumerCount, currentCount)
 }
 
-func (c *Collector) RecordWorkerReplaced(workerID string) {
+func (c *Collector) RecordConsumerReplaced(consumerID string) {
+	log.Printf("[Metrics] Recording consumer replacement: %s", consumerID)
 	normalizedName := c.normalizeQueueName("")
-	c.RecordMetric(normalizedName, MetricWorkerRemovals, 1)
-	c.RecordMetric(normalizedName, MetricWorkerAdditions, 1)
+	c.RecordMetric(normalizedName, MetricConsumerRemovals, 1)
+	c.RecordMetric(normalizedName, MetricConsumerAdditions, 1)
 }
 
 func (c *Collector) publish(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, c.config.PublishInterval.Duration)
 	defer cancel()
 
 	c.mu.RLock()
@@ -389,14 +488,14 @@ func (c *Collector) GetQueueMetrics(queueName string) *QueueMetrics {
 	return nil
 }
 
-func (c *Collector) getWorkerCount() int {
+func (c *Collector) getConsumerCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	normalizedName := c.normalizeQueueName("")
 	if metrics, exists := c.metrics[normalizedName]; exists {
-		if workerCount, exists := metrics[MetricWorkerCount]; exists && len(workerCount.Points) > 0 {
-			return int(workerCount.Points[len(workerCount.Points)-1].Value)
+		if consumerCount, exists := metrics[MetricConsumerCount]; exists && len(consumerCount.Points) > 0 {
+			return int(consumerCount.Points[len(consumerCount.Points)-1].Value)
 		}
 	}
 	return 0
@@ -416,13 +515,13 @@ func (c *Collector) GetAllQueueMetrics() map[string]*QueueMetrics {
 	return result
 }
 
-func (c *Collector) GetWorkerCount() int {
+func (c *Collector) GetConsumerCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	normalizedName := c.normalizeQueueName("")
 	if metrics, exists := c.metrics[normalizedName]; exists {
-		if workerCount, exists := metrics[MetricWorkerCount]; exists && len(workerCount.Points) > 0 {
+		if workerCount, exists := metrics[MetricConsumerCount]; exists && len(workerCount.Points) > 0 {
 			return int(workerCount.Points[len(workerCount.Points)-1].Value)
 		}
 	}

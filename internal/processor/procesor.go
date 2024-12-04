@@ -3,13 +3,15 @@ package processor
 import (
 	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"log"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/consumer"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 type MessageHandler func(context.Context, *consumer.Event) error
@@ -21,14 +23,14 @@ type MessageProcessor struct {
 	collector *metrics.Collector
 	client    *sqs.Client
 
-	// Worker pool management
-	workers    chan struct{} // Semaphore for controlling concurrency
-	workersMu  sync.RWMutex
-	processing sync.WaitGroup
+	// Worker management
+	activeWorkers   map[string]context.CancelFunc
+	workersMu       sync.RWMutex
+	workerSemaphore chan struct{}
 
-	// Processor state
-	currentLoad    int64 // Current number of messages being processed
-	processedCount int64 // Total number of messages processed
+	// Processing state
+	currentLoad    atomic.Int64
+	processedCount atomic.Int64
 	lastScaleCheck time.Time
 	shutdownSignal chan struct{}
 	isShuttingDown bool
@@ -37,91 +39,134 @@ type MessageProcessor struct {
 
 func NewMessageProcessor(config config.ProcessorConfig, buffer *consumer.EventBuffer, handler MessageHandler, collector *metrics.Collector, client *sqs.Client) *MessageProcessor {
 	return &MessageProcessor{
-		config:         config,
-		buffer:         buffer,
-		handler:        handler,
-		collector:      collector,
-		client:         client,
-		workers:        make(chan struct{}, config.MaxConcurrency),
-		shutdownSignal: make(chan struct{}),
+		config:          config,
+		buffer:          buffer,
+		handler:         handler,
+		collector:       collector,
+		client:          client,
+		activeWorkers:   make(map[string]context.CancelFunc),
+		workerSemaphore: make(chan struct{}, config.MaxConcurrency),
+		shutdownSignal:  make(chan struct{}),
 	}
 }
 
 func (p *MessageProcessor) Start(ctx context.Context) error {
-	// Initialize worker pool with minimum concurrency
+	log.Printf("[Processor] Starting with initial concurrency: %d", p.config.MinConcurrency)
+
+	// Start initial workers
 	for i := 0; i < p.config.MinConcurrency; i++ {
-		p.workers <- struct{}{}
+		if err := p.startNewWorker(ctx); err != nil {
+			return fmt.Errorf("failed to start initial worker: %w", err)
+		}
 	}
 
-	log.Printf("Starting message processor with %d concurrency", p.config.MinConcurrency)
-
-	// Start scaling goroutine
+	// Start scaling monitoring
 	go p.monitorAndScale(ctx)
-
-	// Start main processing loop
-	go p.processLoop(ctx)
 
 	return nil
 }
 
-func (p *MessageProcessor) processLoop(ctx context.Context) {
+func (p *MessageProcessor) startNewWorker(ctx context.Context) error {
+	workerID := fmt.Sprintf("processor-worker-%d", time.Now().UnixNano())
+	workerCtx, cancel := context.WithCancel(ctx)
+
+	p.workersMu.Lock()
+	p.activeWorkers[workerID] = cancel
+	p.workersMu.Unlock()
+
+	go func() {
+		defer func() {
+			p.workersMu.Lock()
+			delete(p.activeWorkers, workerID)
+			p.workersMu.Unlock()
+			cancel()
+		}()
+
+		p.processLoop(workerCtx, workerID)
+	}()
+
+	log.Printf("[Processor] Started new worker: %s", workerID)
+	return nil
+}
+
+func (p *MessageProcessor) processLoop(ctx context.Context, workerID string) {
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[Processor] Worker %s stopping due to context cancellation", workerID)
 			return
 		case <-p.shutdownSignal:
+			log.Printf("[Processor] Worker %s stopping due to shutdown signal", workerID)
 			return
 		default:
-			// Try to get a worker from the pool
+			// Try to acquire worker semaphore
 			select {
-			case worker := <-p.workers:
-				// Got a worker, try to get a message
-				if event, err := p.buffer.Pop(ctx); err == nil && event != nil {
-					log.Printf("Processing message: %s\n", *event.Message.MessageId)
-					p.processing.Add(1)
-					go func() {
-						defer p.processing.Done()
-						defer func() { p.workers <- worker }() // Return worker to pool
-
-						p.processMessage(ctx, event)
-					}()
-				} else {
-					log.Printf("Error popping message: %v\n", err)
-					// No message available, return worker immediately
-					p.workers <- worker
-					time.Sleep(10 * time.Millisecond) // Prevent tight loop
+			case p.workerSemaphore <- struct{}{}:
+				event, err := p.buffer.Pop(ctx)
+				if err != nil {
+					<-p.workerSemaphore
+					if err != context.Canceled {
+						log.Printf("[Processor] Worker %s error popping message: %v", workerID, err)
+					}
+					time.Sleep(100 * time.Millisecond)
+					continue
 				}
-			default:
-				// No workers available, wait briefly
-				time.Sleep(10 * time.Millisecond)
+
+				if event == nil {
+					<-p.workerSemaphore
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+
+				p.currentLoad.Add(1)
+				startTime := time.Now()
+
+				log.Printf("[Processor] Worker %s processing message %s from queue %s",
+					workerID, *event.Message.MessageId, event.QueueName)
+
+				if err := p.processMessage(ctx, event); err != nil {
+					log.Printf("[Processor] Worker %s failed to process message %s: %v",
+						workerID, *event.Message.MessageId, err)
+				}
+
+				duration := time.Since(startTime)
+				p.currentLoad.Add(-1)
+				p.processedCount.Add(1)
+				<-p.workerSemaphore
+
+				log.Printf("[Processor] Worker %s completed message %s in %v. Total processed: %d",
+					workerID, *event.Message.MessageId, duration, p.processedCount.Load())
+
+			case <-ctx.Done():
+				return
+			case <-p.shutdownSignal:
+				return
 			}
 		}
 	}
 }
 
-func (p *MessageProcessor) processMessage(ctx context.Context, event *consumer.Event) {
-	startTime := time.Now()
-
-	// Create timeout context for message processing
+func (p *MessageProcessor) processMessage(ctx context.Context, event *consumer.Event) error {
 	msgCtx, cancel := context.WithTimeout(ctx, p.config.ProcessTimeout.Duration)
 	defer cancel()
 
-	// Process the message
+	startTime := time.Now()
 	err := p.handler(msgCtx, event)
-
 	duration := time.Since(startTime)
 
 	if err != nil {
 		p.collector.RecordError(event.QueueName, "process_error")
-		fmt.Printf("Error processing message: %v\n", err)
-	} else {
-		if err := p.deleteMessage(msgCtx, event); err != nil {
-			log.Printf("Processor failed to delete message %s: %v\n", *event.Message.MessageId, err)
-		} else {
-			log.Printf("Processor successfully processed and deleted message %s\n", *event.Message.MessageId)
-			p.collector.RecordProcessingComplete(event.QueueName, int(event.Priority), duration)
-		}
+		log.Printf("[Processor] Error processing message %s: %v", *event.Message.MessageId, err)
+		return err
 	}
+
+	if err := p.deleteMessage(msgCtx, event); err != nil {
+		log.Printf("[Processor] Failed to delete message %s: %v", *event.Message.MessageId, err)
+		return err
+	}
+
+	p.collector.RecordProcessingComplete(event.QueueName, int(event.Priority), duration)
+	return nil
 }
 
 func (p *MessageProcessor) deleteMessage(ctx context.Context, event *consumer.Event) error {
@@ -162,84 +207,105 @@ func (p *MessageProcessor) adjustConcurrency() {
 	defer p.mu.Unlock()
 
 	metrics := p.buffer.GetMetrics()
+	currentLoad := p.currentLoad.Load()
 
-	// Calculate average buffer utilization
-	avgUtilization := (metrics.HighPriorityUtilization +
-		metrics.MediumPriorityUtilization +
-		metrics.LowPriorityUtilization) / 3.0
+	p.workersMu.RLock()
+	currentWorkers := len(p.activeWorkers)
+	p.workersMu.RUnlock()
 
-	currentWorkers := cap(p.workers)
+	log.Printf("[Processor] Scaling check - Current workers: %d, Load: %d, Buffer utilization: %.2f%%",
+		currentWorkers, currentLoad, metrics.GetAverageUtilization()*100)
 
-	if avgUtilization > p.config.ScaleUpThreshold {
-		// Scale up workers if below max
+	if metrics.GetAverageUtilization() > p.config.ScaleUpThreshold {
 		if currentWorkers < p.config.MaxConcurrency {
-			newSize := min(currentWorkers+5, p.config.MaxConcurrency)
-			p.resizeWorkerPool(newSize)
-			log.Printf("Scaling up to %d concurrent processors\n", newSize)
+			targetWorkers := min(currentWorkers+5, p.config.MaxConcurrency)
+			workersToAdd := targetWorkers - currentWorkers
+
+			log.Printf("[Processor] Scaling up by adding %d workers (current: %d, target: %d)",
+				workersToAdd, currentWorkers, targetWorkers)
+
+			for i := 0; i < workersToAdd; i++ {
+				if err := p.startNewWorker(context.Background()); err != nil {
+					log.Printf("[Processor] Failed to start new worker during scale up: %v", err)
+					break
+				}
+			}
 		}
-	} else if avgUtilization < p.config.ScaleDownThreshold {
-		// Scale down workers if above min
+	} else if metrics.GetAverageUtilization() < p.config.ScaleDownThreshold {
 		if currentWorkers > p.config.MinConcurrency {
-			newSize := max(currentWorkers-1, p.config.MinConcurrency)
-			p.resizeWorkerPool(newSize)
-			log.Printf("Scaling down to %d concurrent processors\n", newSize)
+			workersToRemove := 1
+			targetWorkers := max(currentWorkers-workersToRemove, p.config.MinConcurrency)
+
+			log.Printf("[Processor] Scaling down by removing %d workers (current: %d, target: %d)",
+				workersToRemove, currentWorkers, targetWorkers)
+
+			// Get the workers to remove
+			p.workersMu.Lock()
+			count := 0
+			for workerID, cancel := range p.activeWorkers {
+				if count >= workersToRemove || len(p.activeWorkers) <= p.config.MinConcurrency {
+					break
+				}
+				log.Printf("[Processor] Gracefully stopping worker %s", workerID)
+				cancel()
+				count++
+			}
+			p.workersMu.Unlock()
 		}
 	}
-}
-
-func (p *MessageProcessor) resizeWorkerPool(newSize int) {
-	p.workersMu.Lock()
-	defer p.workersMu.Unlock()
-
-	// Create new worker pool
-	newWorkers := make(chan struct{}, newSize)
-
-	// Transfer existing workers or add new ones
-	currentSize := len(p.workers)
-	if newSize > currentSize {
-		// Copy existing workers
-		for i := 0; i < currentSize; i++ {
-			<-p.workers
-			newWorkers <- struct{}{}
-		}
-		// Add new workers
-		for i := currentSize; i < newSize; i++ {
-			newWorkers <- struct{}{}
-		}
-	} else {
-		// Copy subset of workers
-		for i := 0; i < newSize; i++ {
-			<-p.workers
-			newWorkers <- struct{}{}
-		}
-		// Drain remaining workers
-		for i := newSize; i < currentSize; i++ {
-			<-p.workers
-		}
-	}
-
-	// Replace worker pool
-	close(p.workers)
-	p.workers = newWorkers
 }
 
 func (p *MessageProcessor) Shutdown(ctx context.Context) error {
+	log.Printf("[Processor] Initiating shutdown sequence")
+
 	p.mu.Lock()
+	if p.isShuttingDown {
+		p.mu.Unlock()
+		return fmt.Errorf("shutdown already in progress")
+	}
 	p.isShuttingDown = true
 	close(p.shutdownSignal)
 	p.mu.Unlock()
 
-	// Wait for all processors to finish
-	doneCh := make(chan struct{})
+	// Create shutdown tracking channel
+	allWorkersDone := make(chan struct{})
+
 	go func() {
-		p.processing.Wait()
-		close(doneCh)
+		// Cancel all worker contexts
+		p.workersMu.Lock()
+		log.Printf("[Processor] Stopping %d active workers", len(p.activeWorkers))
+		for workerID, cancel := range p.activeWorkers {
+			log.Printf("[Processor] Sending shutdown signal to worker %s", workerID)
+			cancel()
+		}
+		p.workersMu.Unlock()
+
+		// Wait for workers to finish
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			p.workersMu.RLock()
+			activeCount := len(p.activeWorkers)
+			p.workersMu.RUnlock()
+
+			if activeCount == 0 {
+				break
+			}
+
+			log.Printf("[Processor] Waiting for %d workers to complete", activeCount)
+			<-ticker.C
+		}
+
+		close(allWorkersDone)
 	}()
 
+	// Wait for either context timeout or workers to finish
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
-	case <-doneCh:
+		return fmt.Errorf("shutdown timed out: %w", ctx.Err())
+	case <-allWorkersDone:
+		log.Printf("[Processor] All workers have stopped. Total messages processed: %d", p.processedCount.Load())
 		return nil
 	}
 }
