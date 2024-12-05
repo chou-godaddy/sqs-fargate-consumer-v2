@@ -244,7 +244,7 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			utilizationRate := float64(activeWorkers) / float64(currentWorkers)
 
 			// Scale based on both buffer and worker utilization
-			if (metrics.HighPriorityUsage > mp.config.ScaleThreshold ||
+			if (metrics.HighPriorityUsage > mp.config.ScaleThreshold &&
 				utilizationRate > mp.config.ScaleThreshold) &&
 				currentWorkers < int32(mp.config.MaxWorkers) {
 				mp.startWorker()

@@ -17,11 +17,12 @@ import (
 )
 
 type ConsumerGroup struct {
-	config    config.ConsumerConfig
-	sqsClient *sqs.Client
-	scheduler interfaces.Scheduler
-	buffer    interfaces.MessageBuffer
-	collector interfaces.MetricsCollector
+	config                 config.ConsumerConfig
+	sqsClient              *sqs.Client
+	scheduler              interfaces.Scheduler
+	buffer                 interfaces.MessageBuffer
+	collector              interfaces.MetricsCollector
+	bufferMetricsCollector interfaces.BufferMetricsCollector
 
 	workers     map[string]*Consumer
 	workerCount atomic.Int32
@@ -53,17 +54,19 @@ func NewConsumerGroup(
 	scheduler interfaces.Scheduler,
 	buffer interfaces.MessageBuffer,
 	collector interfaces.MetricsCollector,
+	bufferMetricsCollector interfaces.BufferMetricsCollector,
 ) *ConsumerGroup {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ConsumerGroup{
-		config:     config,
-		sqsClient:  sqsClient,
-		scheduler:  scheduler,
-		buffer:     buffer,
-		collector:  collector,
-		workers:    make(map[string]*Consumer),
-		ctx:        ctx,
-		cancelFunc: cancel,
+		config:                 config,
+		sqsClient:              sqsClient,
+		scheduler:              scheduler,
+		buffer:                 buffer,
+		collector:              collector,
+		workers:                make(map[string]*Consumer),
+		ctx:                    ctx,
+		cancelFunc:             cancel,
+		bufferMetricsCollector: bufferMetricsCollector,
 	}
 }
 
@@ -133,6 +136,19 @@ func (cg *ConsumerGroup) runWorker(consumer *Consumer) {
 }
 
 func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
+	// Get buffer metrics
+	bufferMetrics := cg.bufferMetricsCollector.GetMetrics()
+
+	// Check buffer utilization before polling
+	bufferUsage := float64(bufferMetrics.TotalMessagesIn-
+		bufferMetrics.TotalMessagesOut) / float64(bufferMetrics.TotalSize)
+
+	if bufferUsage > 0.9 {
+		// Back off when buffer is near full
+		time.Sleep(500 * time.Millisecond)
+		return nil
+	}
+
 	consumer.status.Store(consumerStatusPolling)
 	defer consumer.status.Store(consumerStatusIdle)
 
@@ -221,11 +237,13 @@ func (cg *ConsumerGroup) monitorAndScale() {
 			}
 
 			currentWorkers := cg.workerCount.Load()
+			bufferMetrics := cg.bufferMetricsCollector.GetMetrics()
 			desiredWorkers := calculateDesiredWorkers(
 				totalMessages,
 				totalInFlight,
 				avgProcessingTime,
 				cg.config,
+				bufferMetrics,
 			)
 
 			// Apply scaling decisions
@@ -243,29 +261,42 @@ func (cg *ConsumerGroup) monitorAndScale() {
 	}
 }
 
-func calculateDesiredWorkers(totalMessages, inFlight int64, avgProcessingTime float64, config config.ConsumerConfig) int64 {
+func calculateDesiredWorkers(totalMessages, inFlight int64, avgProcessingTime float64, config config.ConsumerConfig, bufferMetrics models.BufferMetrics) int64 {
+	// Check buffer capacity first
+	bufferCapacity := float64(bufferMetrics.HighPriorityUsage +
+		bufferMetrics.MediumPriorityUsage +
+		bufferMetrics.LowPriorityUsage)
+
+	bufferUsage := float64(bufferMetrics.TotalMessagesIn-
+		bufferMetrics.TotalMessagesOut) / bufferCapacity
+
+	// If buffer is near capacity, reduce workers
+	if bufferUsage > 0.9 {
+		return max(int64(config.MinWorkers), int64(float64(config.MaxWorkers)*(1-bufferUsage)))
+	}
+
 	// Calculate processing capacity needed
 	if totalMessages == 0 && inFlight == 0 {
 		return int64(config.MinWorkers)
 	}
 
-	// Estimate messages per worker per second
+	// Available buffer capacity
+	availableBuffer := int64((1 - bufferUsage) * bufferCapacity)
+
+	// Calculate based on processing capacity and available buffer
 	messagesPerWorkerPerSecond := 1000.0 / max(avgProcessingTime, 100.0)
 
-	// Calculate needed workers based on total workload
-	totalWorkload := float64(totalMessages + inFlight)
-	desiredWorkers := int64(math.Ceil(totalWorkload / (messagesPerWorkerPerSecond * float64(config.ScaleInterval.Seconds()))))
+	// Consider both queue depth and buffer availability
+	effectiveWorkload := min(
+		float64(totalMessages+inFlight),
+		float64(availableBuffer),
+	)
 
-	// Apply boundaries
-	desiredWorkers = max(int64(config.MinWorkers), min(desiredWorkers, int64(config.MaxWorkers)))
+	desiredWorkers := int64(math.Ceil(effectiveWorkload /
+		(messagesPerWorkerPerSecond * float64(config.ScaleInterval.Seconds()))))
 
-	// Add headroom for bursts
-	if totalMessages > 0 {
-		burstFactor := math.Log1p(float64(totalMessages)) / math.Log1p(1000.0)
-		desiredWorkers = int64(float64(desiredWorkers) * (1 + burstFactor*0.2))
-	}
-
-	return desiredWorkers
+	// Apply bounds
+	return max(int64(config.MinWorkers), min(desiredWorkers, int64(config.MaxWorkers)))
 }
 
 func (cg *ConsumerGroup) stopWorker() {

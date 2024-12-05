@@ -162,10 +162,11 @@ func (s *SchedulerImpl) calculateQueueScore(queue config.QueueConfig, now time.T
 	// Add a capped wait time factor
 	lastPoll, exists := s.lastPollTimes[queue.Name]
 	if exists {
+		// How many seconds since last poll
 		waitTime := now.Sub(lastPoll).Seconds()
 		// Cap the wait time boost to prevent overwhelming priority
-		maxWaitBoost := float64(queue.Priority) * 0.5 // Higher priority = smaller max boost
-		waitFactor := math.Min(1.0+(waitTime/30.0), 1.0+maxWaitBoost)
+		maxWaitBoost := float64(queue.Priority) * 0.5                 // Higher priority = smaller max boost
+		waitFactor := math.Min(1.0+(waitTime/30.0), 1.0+maxWaitBoost) // reach maximum boost after 30 seconds
 		score *= waitFactor
 	}
 

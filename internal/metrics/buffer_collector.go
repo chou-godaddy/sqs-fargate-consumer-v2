@@ -74,16 +74,19 @@ func (c *BufferMetricsCollector) OnBufferOverflow(priority models.Priority) {
 }
 
 func (c *BufferMetricsCollector) OnQueueSizeChanged(priority models.Priority, currentSize, capacity int) {
-	usage := float64(currentSize) / float64(capacity)
-	usageScaled := int64(usage * 100)
+	if capacity == 0 {
+		return
+	}
+	// Store as parts per million (ppm) for better precision
+	usage := int64((float64(currentSize) / float64(capacity)) * 1_000_000)
 
 	switch priority {
 	case models.PriorityHigh:
-		c.highPriorityUsage.Store(usageScaled)
+		c.highPriorityUsage.Store(usage)
 	case models.PriorityMedium:
-		c.mediumPriorityUsage.Store(usageScaled)
+		c.mediumPriorityUsage.Store(usage)
 	case models.PriorityLow:
-		c.lowPriorityUsage.Store(usageScaled)
+		c.lowPriorityUsage.Store(usage)
 	}
 }
 
@@ -144,30 +147,39 @@ func (c *BufferMetricsCollector) calculateWaitTimeMetrics() (time.Duration, time
 }
 
 func (c *BufferMetricsCollector) GetMetrics() models.BufferMetrics {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	avgWait, maxWait, histogram := c.calculateWaitTimeMetrics()
-	timeSinceLastUpdate := time.Since(c.lastMetricsUpdate)
-	messageRate := float64(c.totalMessagesOut.Load()) / timeSinceLastUpdate.Seconds()
-
+	// Minizime locking by collecting all metrics without locks first
 	metrics := models.BufferMetrics{
-		HighPriorityUsage:      float64(c.highPriorityUsage.Load()) / 100.0,
-		MediumPriorityUsage:    float64(c.mediumPriorityUsage.Load()) / 100.0,
-		LowPriorityUsage:       float64(c.lowPriorityUsage.Load()) / 100.0,
+		HighPriorityUsage:      float64(c.highPriorityUsage.Load()) / 1_000_000,
+		MediumPriorityUsage:    float64(c.mediumPriorityUsage.Load()) / 1_000_000,
+		LowPriorityUsage:       float64(c.lowPriorityUsage.Load()) / 1_000_000,
 		TotalSize:              c.totalSize.Load(),
 		OverflowCount:          c.overflowCount.Load(),
-		AverageWaitTime:        avgWait,
-		MaxWaitTime:            maxWait,
-		WaitTimeHistogram:      histogram,
 		TotalMessagesIn:        c.totalMessagesIn.Load(),
 		TotalMessagesOut:       c.totalMessagesOut.Load(),
-		MessageProcessingRate:  messageRate,
 		HighPriorityMessages:   c.messagesPerPriority[models.PriorityHigh].Load(),
 		MediumPriorityMessages: c.messagesPerPriority[models.PriorityMedium].Load(),
 		LowPriorityMessages:    c.messagesPerPriority[models.PriorityLow].Load(),
 	}
 
+	// Only lock for wait time calculations
+	c.waitTimeMu.RLock()
+	avgWait, maxWait, histogram := c.calculateWaitTimeMetrics()
+	c.waitTimeMu.RUnlock()
+
+	metrics.AverageWaitTime = avgWait
+	metrics.MaxWaitTime = maxWait
+	metrics.WaitTimeHistogram = histogram
+
+	// Short lock just for updating the last metrics time
+	c.mu.Lock()
+	timeSinceLastUpdate := time.Since(c.lastMetricsUpdate)
 	c.lastMetricsUpdate = time.Now()
+	c.mu.Unlock()
+
+	// Calculate rate after releasing lock
+	if timeSinceLastUpdate > 0 {
+		metrics.MessageProcessingRate = float64(metrics.TotalMessagesOut) / timeSinceLastUpdate.Seconds()
+	}
+
 	return metrics
 }

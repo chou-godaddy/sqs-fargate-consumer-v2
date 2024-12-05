@@ -71,7 +71,7 @@ func main() {
 	scheduler := scheduler.NewScheduler(cfg.Consumer.Queues, collector)
 
 	// Create consumer group
-	consumerGroup := consumer.NewConsumerGroup(cfg.Consumer, dep.SQSClient, scheduler, buffer, collector)
+	consumerGroup := consumer.NewConsumerGroup(cfg.Consumer, dep.SQSClient, scheduler, buffer, collector, bufferMetrcisCollector)
 
 	// Create message processor
 	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep.SQSClient, collector, bufferMetrcisCollector)
