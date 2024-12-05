@@ -63,6 +63,10 @@ func main() {
 	// Create message buffer
 	buffer := consumer.NewMessageBuffer(cfg.Buffer)
 
+	bufferMetrcisCollector := collector.GetBufferMetricsCollector()
+
+	buffer.SetMetricsEmitter(bufferMetrcisCollector)
+
 	// Create scheduler
 	scheduler := scheduler.NewScheduler(cfg.Consumer.Queues, collector)
 
@@ -70,7 +74,7 @@ func main() {
 	consumerGroup := consumer.NewConsumerGroup(cfg.Consumer, dep.SQSClient, scheduler, buffer, collector)
 
 	// Create message processor
-	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep.SQSClient, collector)
+	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep.SQSClient, collector, bufferMetrcisCollector)
 
 	// Create root context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())

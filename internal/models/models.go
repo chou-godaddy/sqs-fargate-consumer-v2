@@ -49,11 +49,30 @@ type WorkerMetrics struct {
 
 // BufferMetrics represents buffer utilization metrics
 type BufferMetrics struct {
-	HighPriorityUsage   float64
-	MediumPriorityUsage float64
-	LowPriorityUsage    float64
-	TotalSize           int64
-	OverflowCount       int32
+	// Queue utilization metrics
+	HighPriorityUsage   float64 // Percentage of high priority queue capacity used (0-1)
+	MediumPriorityUsage float64 // Percentage of medium priority queue capacity used (0-1)
+	LowPriorityUsage    float64 // Percentage of low priority queue capacity used (0-1)
+
+	// Message counts
+	TotalSize              int64 // Total size of all messages currently in buffer
+	TotalMessagesIn        int64 // Total messages pushed to buffer
+	TotalMessagesOut       int64 // Total messages popped from buffer
+	HighPriorityMessages   int64 // Count of high priority messages processed
+	MediumPriorityMessages int64 // Count of medium priority messages processed
+	LowPriorityMessages    int64 // Count of low priority messages processed
+	OverflowCount          int32 // Number of times buffer was full when trying to push
+
+	// Wait time metrics
+	AverageWaitTime   time.Duration    // Average time messages spend in buffer
+	MaxWaitTime       time.Duration    // Maximum time any message spent in buffer
+	WaitTimeHistogram map[string]int64 // Distribution of wait times in various buckets
+
+	// Processing metrics
+	MessageProcessingRate float64 // Messages processed per second
+
+	// Point-in-time metrics
+	LastUpdateTime time.Time // When these metrics were last updated
 }
 
 // ProcessorMetrics represents metrics specific to message processing

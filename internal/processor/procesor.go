@@ -17,10 +17,11 @@ import (
 )
 
 type MessageProcessorImpl struct {
-	config    config.ProcessorConfig
-	buffer    interfaces.MessageBuffer
-	sqsClient *sqs.Client
-	collector interfaces.MetricsCollector
+	config                 config.ProcessorConfig
+	buffer                 interfaces.MessageBuffer
+	sqsClient              *sqs.Client
+	collector              interfaces.MetricsCollector
+	bufferMetricsCollector interfaces.BufferMetricsCollector
 
 	workers     map[string]*Worker
 	workerCount atomic.Int32
@@ -55,16 +56,18 @@ func NewMessageProcessor(
 	buffer interfaces.MessageBuffer,
 	sqsClient *sqs.Client,
 	collector interfaces.MetricsCollector,
+	bufferMetricsCollector interfaces.BufferMetricsCollector,
 ) interfaces.MessageProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MessageProcessorImpl{
-		config:     config,
-		buffer:     buffer,
-		sqsClient:  sqsClient,
-		collector:  collector,
-		workers:    make(map[string]*Worker),
-		ctx:        ctx,
-		cancelFunc: cancel,
+		config:                 config,
+		buffer:                 buffer,
+		sqsClient:              sqsClient,
+		collector:              collector,
+		workers:                make(map[string]*Worker),
+		ctx:                    ctx,
+		cancelFunc:             cancel,
+		bufferMetricsCollector: bufferMetricsCollector,
 	}
 }
 
@@ -225,7 +228,7 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 		case <-mp.ctx.Done():
 			return
 		case <-ticker.C:
-			metrics := mp.buffer.GetMetrics()
+			metrics := mp.bufferMetricsCollector.GetMetrics()
 			currentWorkers := mp.workerCount.Load()
 
 			// Calculate worker utilization

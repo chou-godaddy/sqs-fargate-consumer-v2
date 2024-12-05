@@ -20,6 +20,7 @@ import (
 type Collector struct {
 	sqsClient        *sqs.Client
 	cloudwatchClient *cloudwatch.Client
+	bufferMetrics    *BufferMetricsCollector
 	queues           map[string]string // map[QueueName]QueueURL
 	metrics          sync.Map          // map[string]*QueueMetrics
 	updateInterval   time.Duration
@@ -53,6 +54,7 @@ func NewCollector(sqsClient *sqs.Client, cloudwatchClient *cloudwatch.Client, qu
 	return &Collector{
 		sqsClient:        sqsClient,
 		cloudwatchClient: cloudwatchClient,
+		bufferMetrics:    NewBufferMetricsCollector(),
 		queues:           queueMap,
 		updateInterval:   time.Second,
 		namespace:        "SQS-FARGATE-CONSUMER-V2/SQSConsumer",
@@ -126,8 +128,8 @@ func (c *Collector) collectQueueMetrics(ctx context.Context, queueName, queueURL
 			}
 
 			c.metrics.Store(queueName, metrics)
-			log.Printf("[Collector] Updated metrics for queue %s - Messages: %d, InFlight: %d, Historical points: %d",
-				queueName, metrics.MessageCount, metrics.InFlightCount, len(metrics.HistoricalPoints))
+			// log.Printf("[Collector] Updated metrics for queue %s - Messages: %d, InFlight: %d, Historical points: %d",
+			// 	queueName, metrics.MessageCount, metrics.InFlightCount, len(metrics.HistoricalPoints))
 		}
 	}
 }
@@ -175,20 +177,18 @@ func (c *Collector) publishMetrics(ctx context.Context) {
 func (c *Collector) publishToCloudWatch(ctx context.Context) error {
 	var metricData []types.MetricDatum
 
+	// Collect SQS queue metrics
 	c.metrics.Range(func(key, value interface{}) bool {
 		queueName := key.(string)
 		metrics := value.(*models.QueueMetrics)
 
-		// Publish all historical points collected since last publish
-		for _, point := range metrics.HistoricalPoints {
-			// Queue depth metrics
-			metricData = append(metricData,
-				c.createMetricDatum("VisibleMessages", float64(point.MessageCount), types.StandardUnitCount, queueName, point.Timestamp),
-				c.createMetricDatum("InFlightMessages", float64(point.InFlightCount), types.StandardUnitCount, queueName, point.Timestamp),
-			)
-		}
+		// Queue depth metrics
+		metricData = append(metricData,
+			c.createMetricDatum("VisibleMessages", float64(metrics.MessageCount), types.StandardUnitCount, queueName, time.Now()),
+			c.createMetricDatum("InFlightMessages", float64(metrics.InFlightCount), types.StandardUnitCount, queueName, time.Now()),
+		)
 
-		// Current performance metrics
+		// Performance metrics
 		if metrics.ProcessedCount.Load() > 0 {
 			avgProcessingTime := float64(metrics.ProcessingTime.Load()) / float64(metrics.ProcessedCount.Load())
 			metricData = append(metricData,
@@ -198,13 +198,51 @@ func (c *Collector) publishToCloudWatch(ctx context.Context) error {
 				c.createMetricDatum("MaxLatency", float64(metrics.MaxLatency.Load()), types.StandardUnitMilliseconds, queueName, time.Now()),
 			)
 		}
-
-		// Clear historical points after publishing
-		metrics.HistoricalPoints = nil
 		return true
 	})
 
-	// Publish in batches of 20 (CloudWatch limit)
+	// Collect buffer metrics
+	bufferMetrics := c.GetBufferMetrics()
+
+	// Queue usage metrics
+	metricData = append(metricData,
+		c.createMetricDatum("BufferHighPriorityUsage", bufferMetrics.HighPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+		c.createMetricDatum("BufferMediumPriorityUsage", bufferMetrics.MediumPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+		c.createMetricDatum("BufferLowPriorityUsage", bufferMetrics.LowPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+	)
+
+	// Message counts
+	metricData = append(metricData,
+		c.createMetricDatum("BufferTotalSize", float64(bufferMetrics.TotalSize), types.StandardUnitBytes, "Buffer", time.Now()),
+		c.createMetricDatum("BufferMessagesIn", float64(bufferMetrics.TotalMessagesIn), types.StandardUnitCount, "Buffer", time.Now()),
+		c.createMetricDatum("BufferMessagesOut", float64(bufferMetrics.TotalMessagesOut), types.StandardUnitCount, "Buffer", time.Now()),
+		c.createMetricDatum("BufferOverflows", float64(bufferMetrics.OverflowCount), types.StandardUnitCount, "Buffer", time.Now()),
+	)
+
+	// Wait time metrics
+	metricData = append(metricData,
+		c.createMetricDatum("BufferAverageWaitTime", float64(bufferMetrics.AverageWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
+		c.createMetricDatum("BufferMaxWaitTime", float64(bufferMetrics.MaxWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
+	)
+
+	// Wait time histogram
+	for bucket, count := range bufferMetrics.WaitTimeHistogram {
+		metricData = append(metricData,
+			c.createMetricDatum("BufferWaitTimeDistribution", float64(count), types.StandardUnitCount, "Buffer", time.Now(),
+				types.Dimension{
+					Name:  aws.String("TimeBucket"),
+					Value: aws.String(bucket),
+				},
+			),
+		)
+	}
+
+	// Processing rate
+	metricData = append(metricData,
+		c.createMetricDatum("BufferProcessingRate", bufferMetrics.MessageProcessingRate, types.StandardUnitCountSecond, "Buffer", time.Now()),
+	)
+
+	// Publish metrics in batches of 20 (CloudWatch limit)
 	for i := 0; i < len(metricData); i += 20 {
 		end := i + 20
 		if end > len(metricData) {
@@ -224,22 +262,24 @@ func (c *Collector) publishToCloudWatch(ctx context.Context) error {
 	return nil
 }
 
-func (c *Collector) createMetricDatum(name string, value float64, unit types.StandardUnit, queueName string, timestamp time.Time) types.MetricDatum {
+func (c *Collector) createMetricDatum(name string, value float64, unit types.StandardUnit, dimension string, timestamp time.Time, extraDims ...types.Dimension) types.MetricDatum {
+	dimensions := append([]types.Dimension{
+		{
+			Name:  aws.String("Component"),
+			Value: aws.String(dimension),
+		},
+		{
+			Name:  aws.String("Region"),
+			Value: aws.String(c.region),
+		},
+	}, extraDims...)
+
 	return types.MetricDatum{
 		MetricName: aws.String(name),
 		Value:      aws.Float64(value),
 		Unit:       unit,
 		Timestamp:  aws.Time(timestamp),
-		Dimensions: []types.Dimension{
-			{
-				Name:  aws.String("QueueName"),
-				Value: aws.String(queueName),
-			},
-			{
-				Name:  aws.String("Region"),
-				Value: aws.String(c.region),
-			},
-		},
+		Dimensions: dimensions,
 	}
 }
 
@@ -310,4 +350,41 @@ func getIntAttribute(attrs map[string]string, key string) int64 {
 		return result
 	}
 	return 0
+}
+
+// BufferMetricsEmitter interface implementation
+func (c *Collector) OnMessageEnqueued(message *models.Message) {
+	if c.bufferMetrics != nil {
+		c.bufferMetrics.OnMessageEnqueued(message)
+	}
+}
+
+func (c *Collector) OnMessageDequeued(message *models.Message) {
+	if c.bufferMetrics != nil {
+		c.bufferMetrics.OnMessageDequeued(message)
+	}
+}
+
+func (c *Collector) OnBufferOverflow(priority models.Priority) {
+	if c.bufferMetrics != nil {
+		c.bufferMetrics.OnBufferOverflow(priority)
+	}
+}
+
+func (c *Collector) OnQueueSizeChanged(priority models.Priority, currentSize, capacity int) {
+	if c.bufferMetrics != nil {
+		c.bufferMetrics.OnQueueSizeChanged(priority, currentSize, capacity)
+	}
+}
+
+// BufferMetricsProvider interface implementation
+func (c *Collector) GetBufferMetrics() models.BufferMetrics {
+	if c.bufferMetrics != nil {
+		return c.bufferMetrics.GetMetrics()
+	}
+	return models.BufferMetrics{}
+}
+
+func (c *Collector) GetBufferMetricsCollector() interfaces.BufferMetricsCollector {
+	return c.bufferMetrics
 }

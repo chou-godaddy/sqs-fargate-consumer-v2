@@ -20,6 +20,7 @@ type MetricsCollector interface {
 	RecordProcessed(queueName string, duration time.Duration)
 	GetQueueMetrics(queueName string) *models.QueueMetrics
 	GetAllQueueMetrics() map[string]*models.QueueMetrics
+	GetBufferMetricsCollector() BufferMetricsCollector
 }
 
 // MessageBuffer defines the interface for priority-based message buffering
@@ -27,7 +28,7 @@ type MessageBuffer interface {
 	Component
 	Push(*models.Message) error
 	Pop(context.Context) (*models.Message, error)
-	GetMetrics() models.BufferMetrics
+	SetMetricsEmitter(BufferMetricsEmitter)
 }
 
 // Scheduler defines the interface for queue selection and management
@@ -48,4 +49,17 @@ type MessageProcessor interface {
 	Component
 	// GetMetrics returns current processor metrics
 	GetMetrics() models.ProcessorMetrics
+}
+
+// BufferMetricsEmitter defines the interface for emitting buffer metrics
+type BufferMetricsEmitter interface {
+	OnMessageEnqueued(message *models.Message)
+	OnMessageDequeued(message *models.Message)
+	OnBufferOverflow(priority models.Priority)
+	OnQueueSizeChanged(priority models.Priority, currentSize, capacity int)
+}
+
+type BufferMetricsCollector interface {
+	BufferMetricsEmitter
+	GetMetrics() models.BufferMetrics
 }

@@ -129,7 +129,7 @@
                 "url": "https://sqs.us-west-2.amazonaws.com/982600293865/sqs-fargate-consumer-v2-medium",
                 "name": "medium-priority",
                 "priority": 2,
-                "weight": 0.8,
+                "weight": 0.75,
                 "maxBatchSize": 10,
                 "pollInterval": "2s" 
             },
@@ -137,16 +137,16 @@
                 "url": "https://sqs.us-west-2.amazonaws.com/982600293865/sqs-fargate-consumer-v2-low",
                 "name": "low-priority",
                 "priority": 1,
-                "weight": 0.6,
+                "weight": 0.5,
                 "maxBatchSize": 10,
                 "pollInterval": "5s" 
             }
         ]
     },
     "buffer": {
-        "highPrioritySize": 2500,
-        "mediumPrioritySize": 1500,
-        "lowPrioritySize": 1000,
+        "highPrioritySize": 6000,
+        "mediumPrioritySize": 5000,
+        "lowPrioritySize": 4000,
         "maxMessageSize": 262144,
         "scaleThreshold": 0.8
     },
