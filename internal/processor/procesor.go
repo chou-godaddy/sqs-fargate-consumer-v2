@@ -33,6 +33,8 @@ type MessageProcessorImpl struct {
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 	wg         sync.WaitGroup
+
+	scalingMu sync.Mutex // Mutex for scaling operations
 }
 
 type Worker struct {
@@ -108,8 +110,7 @@ func (mp *MessageProcessorImpl) startWorker() error {
 	mp.wg.Add(1)
 	go mp.runWorker(worker)
 
-	log.Printf("[Processor] Started new worker %s. Total workers: %d",
-		workerID, mp.workerCount.Load())
+	log.Printf("[Processor] Started new worker %s. Total workers: %d", workerID, mp.workerCount.Load())
 	return nil
 }
 
@@ -140,8 +141,8 @@ func (mp *MessageProcessorImpl) runWorker(worker *Worker) {
 }
 
 func (w *Worker) processMessage(ctx context.Context) error {
-	w.status.Store(workerStatusProcessing)
-	defer w.status.Store(workerStatusIdle)
+	// Set worker status
+	w.status.Store(workerStatusIdle)
 
 	// Pop message from buffer
 	msg, err := w.processor.buffer.Pop(ctx)
@@ -151,6 +152,9 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	if msg == nil {
 		return nil
 	}
+
+	w.status.Store(workerStatusProcessing)
+	defer w.status.Store(workerStatusIdle)
 
 	startTime := time.Now()
 
@@ -171,8 +175,7 @@ func (w *Worker) processMessage(ctx context.Context) error {
 		randomDuration = time.Duration(randomSeconds) * time.Second
 	}
 
-	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s. Expected duration: %v",
-		w.id, msg.MessageID, msg.Priority, msg.QueueName, randomDuration)
+	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s. Expected duration: %v", w.id, msg.MessageID, msg.Priority, msg.QueueName, randomDuration)
 
 	// Simulate processing with random duration
 	select {
@@ -182,8 +185,7 @@ func (w *Worker) processMessage(ctx context.Context) error {
 		// Processing completed
 	}
 
-	log.Printf("[Worker %s] Finished processing message id %s, body: %s in %v",
-		w.id, msg.MessageID, string(msg.Body), randomDuration)
+	log.Printf("[Worker %s] Finished processing message id %s, body: %s in %v", w.id, msg.MessageID, string(msg.Body), randomDuration)
 
 	// Delete message from SQS
 	if err := w.deleteMessage(processCtx, msg); err != nil {
@@ -228,7 +230,20 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 		case <-mp.ctx.Done():
 			return
 		case <-ticker.C:
-			metrics := mp.bufferMetricsCollector.GetMetrics()
+			// Get metrics without holding scaling lock
+			high, medium, low, ok := mp.bufferMetricsCollector.GetBufferUtilization()
+			if !ok {
+				log.Printf("[Processor] Warning: Buffer utilization metrics not available")
+				continue
+			}
+
+			messagesIn, messagesOut, ok := mp.bufferMetricsCollector.GetMessageCounts()
+			if !ok {
+				log.Printf("[Processor] Warning: Message count metrics not available")
+				messagesIn, messagesOut = 0, 0
+			}
+
+			backlog := messagesIn - messagesOut
 			currentWorkers := mp.workerCount.Load()
 
 			// Calculate worker utilization
@@ -241,16 +256,79 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			}
 			mp.mu.RUnlock()
 
-			utilizationRate := float64(activeWorkers) / float64(currentWorkers)
+			var utilizationRate float64
+			if currentWorkers > 0 {
+				utilizationRate = float64(activeWorkers) / float64(currentWorkers)
+			}
 
-			// Scale based on both buffer and worker utilization
-			if (metrics.HighPriorityUsage > mp.config.ScaleThreshold &&
-				utilizationRate > mp.config.ScaleThreshold) &&
-				currentWorkers < int32(mp.config.MaxWorkers) {
-				mp.startWorker()
-			} else if utilizationRate < mp.config.ScaleThreshold/2 &&
-				currentWorkers > int32(mp.config.MinWorkers) {
-				mp.stopWorker()
+			// Log metrics
+			log.Printf("[Processor] Scaling metrics - Workers: %d/%d (%.2f%% utilized), Backlog: %d, Buffer Usage: High=%.2f%%, Medium=%.2f%%, Low=%.2f%%",
+				currentWorkers, mp.config.MaxWorkers, utilizationRate*100,
+				backlog, high*100, medium*100, low*100)
+
+			// Evaluate scaling conditions
+			shouldScaleUp := false
+			shouldScaleDown := false
+
+			bufferPressure := high > mp.config.ScaleThreshold ||
+				medium > mp.config.ScaleThreshold ||
+				low > mp.config.ScaleThreshold
+
+			workerPressure := utilizationRate > mp.config.ScaleThreshold
+			backlogThreshold := int64(mp.config.MaxWorkers * 10)
+			backlogPressure := backlog > backlogThreshold
+
+			// Determine scaling direction
+			if currentWorkers < int32(mp.config.MaxWorkers) {
+				if bufferPressure {
+					log.Printf("[Processor] Buffer pressure detected (High: %.2f%%, Medium: %.2f%%, Low: %.2f%%)",
+						high*100, medium*100, low*100)
+					shouldScaleUp = true
+				}
+				if workerPressure {
+					log.Printf("[Processor] Worker utilization pressure detected (%.2f%%)",
+						utilizationRate*100)
+					shouldScaleUp = true
+				}
+				if backlogPressure {
+					log.Printf("[Processor] Message backlog pressure detected (%d messages)",
+						backlog)
+					shouldScaleUp = true
+				}
+			}
+
+			if currentWorkers > int32(mp.config.MinWorkers) {
+				lowUtilization := utilizationRate < mp.config.ScaleThreshold/2
+				lowBacklog := backlog < int64(mp.config.MinWorkers*5)
+
+				if lowUtilization && !bufferPressure && lowBacklog {
+					log.Printf("[Processor] Low pressure detected - Utilization: %.2f%%, Backlog: %d",
+						utilizationRate*100, backlog)
+					shouldScaleDown = true
+				}
+			}
+
+			// Only acquire scaling lock when actually scaling
+			if shouldScaleUp || shouldScaleDown {
+				mp.scalingMu.Lock()
+				// Recheck conditions after acquiring lock
+				currentWorkers = mp.workerCount.Load()
+
+				if shouldScaleUp && currentWorkers < int32(mp.config.MaxWorkers) {
+					log.Printf("[Processor] Scaling up worker count: %d -> %d",
+						currentWorkers, currentWorkers+2)
+					// Scale up by 2 workers
+					for i := 0; i < 2; i++ {
+						if err := mp.startWorker(); err != nil {
+							log.Printf("[Processor] Failed to scale up: %v", err)
+						}
+					}
+				} else if shouldScaleDown && currentWorkers > int32(mp.config.MinWorkers) {
+					log.Printf("[Processor] Scaling down worker count: %d -> %d",
+						currentWorkers, currentWorkers-1)
+					mp.stopWorker()
+				}
+				mp.scalingMu.Unlock()
 			}
 		}
 	}
@@ -292,8 +370,7 @@ func (mp *MessageProcessorImpl) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-done:
-		log.Printf("[Processor] Shutdown completed. Processed %d messages, %d errors",
-			mp.processedCount.Load(), mp.errorCount.Load())
+		log.Printf("[Processor] Shutdown completed. Processed %d messages, %d errors", mp.processedCount.Load(), mp.errorCount.Load())
 		return nil
 	}
 }

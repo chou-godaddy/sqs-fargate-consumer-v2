@@ -119,8 +119,7 @@ func (s *SchedulerImpl) SelectQueue() (*config.QueueConfig, error) {
 
 	if selectedQueue != nil {
 		s.updateQueueStats(selectedQueue, now)
-		log.Printf("[Scheduler] Selected queue %s (Priority: %d, Score: %.2f)",
-			selectedQueue.Name, selectedQueue.Priority, highestScore)
+		log.Printf("[Scheduler] Selected queue %s (Priority: %d, Score: %.2f)", selectedQueue.Name, selectedQueue.Priority, highestScore)
 	}
 
 	return selectedQueue, nil
@@ -176,8 +175,7 @@ func (s *SchedulerImpl) calculateQueueScore(queue config.QueueConfig, now time.T
 		score *= 0.95 // Reduced penalty to 5%
 	}
 
-	log.Printf("[Scheduler] Queue %s score details - Priority: %d, Messages: %d, Base Score: %.2f, "+
-		"Final Score: %.2f", queue.Name, queue.Priority, metrics.MessageCount, baseScore, score)
+	log.Printf("[Scheduler] Queue %s score details - Priority: %d, Messages: %d, Base Score: %.2f, Final Score: %.2f", queue.Name, queue.Priority, metrics.MessageCount, baseScore, score)
 
 	return score
 }

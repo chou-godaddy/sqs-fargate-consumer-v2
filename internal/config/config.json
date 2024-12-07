@@ -111,11 +111,16 @@
     "genericQueueEndpointUrl": {{if eq .Env "dev"}}"https://agentservices.phx3.int.dev-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "test"}}"https://agentservices.phx3.int.test-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{ else if eq .Env "prod" }}"https://agentservices.api.phx3.int.godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "ote"}}"https://agentservices.api.phx3.int.ote-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{end}},
     "consumer": {
         "maxWorkers": 100,
-        "minWorkers": 5,
+        "minWorkers": 2,
         "maxBatchSize": 10,
-        "pollInterval": "1s",
+        "minpollInterval": "100ms",
+        "pollBackoffInterval": "2s",
         "scaleInterval": "5s",
-        "scaleThreshold": 0.7,
+        "scaleThreshold": 0.8,
+        "scaleUpCoolDown": "5s",
+        "scaleDownCoolDown": "10s",
+        "scaleUpStep": 3,
+        "scaleDownStep": 1,
         "queues": [
             {
                 "url": "https://sqs.us-west-2.amazonaws.com/982600293865/sqs-fargate-consumer-v2-high",
@@ -148,13 +153,13 @@
         "mediumPrioritySize": 5000,
         "lowPrioritySize": 4000,
         "maxMessageSize": 262144,
-        "scaleThreshold": 0.8
+        "scaleThreshold": 0.7
     },
     "processor": {
-        "maxWorkers": 100,
+        "maxWorkers": 150,
         "minWorkers": 10,
         "processTimeout": "30s",
-        "scaleInterval": "5s",
+        "scaleInterval": "1s",
         "scaleThreshold": 0.7
     }
   }

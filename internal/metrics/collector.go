@@ -18,21 +18,21 @@ import (
 )
 
 type Collector struct {
-	sqsClient        *sqs.Client
-	cloudwatchClient *cloudwatch.Client
-	bufferMetrics    *BufferMetricsCollector
-	queues           map[string]string // map[QueueName]QueueURL
-	metrics          sync.Map          // map[string]*QueueMetrics
-	updateInterval   time.Duration
-	namespace        string
-	region           string
-	maxDataPoints    int
+	sqsClient              *sqs.Client
+	cloudwatchClient       *cloudwatch.Client
+	bufferMetricsCollector interfaces.BufferMetricsCollector
+	queues                 map[string]string // map[QueueName]QueueURL
+	metrics                sync.Map          // map[string]*QueueMetrics
+	updateInterval         time.Duration
+	namespace              string
+	region                 string
+	maxDataPoints          int
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 }
 
-func NewCollector(sqsClient *sqs.Client, cloudwatchClient *cloudwatch.Client, queues []config.QueueConfig) interfaces.MetricsCollector {
+func NewCollector(sqsClient *sqs.Client, cloudwatchClient *cloudwatch.Client, queues []config.QueueConfig, buffBufferMetricsCollector interfaces.BufferMetricsCollector) interfaces.MetricsCollector {
 	if sqsClient == nil {
 		log.Fatal("[Collector] SQS client cannot be nil")
 	}
@@ -52,15 +52,15 @@ func NewCollector(sqsClient *sqs.Client, cloudwatchClient *cloudwatch.Client, qu
 	}
 
 	return &Collector{
-		sqsClient:        sqsClient,
-		cloudwatchClient: cloudwatchClient,
-		bufferMetrics:    NewBufferMetricsCollector(),
-		queues:           queueMap,
-		updateInterval:   time.Second,
-		namespace:        "SQS-FARGATE-CONSUMER-V2/SQSConsumer",
-		region:           "us-west-2",
-		maxDataPoints:    1000,
-		stopChan:         make(chan struct{}),
+		sqsClient:              sqsClient,
+		cloudwatchClient:       cloudwatchClient,
+		bufferMetricsCollector: buffBufferMetricsCollector,
+		queues:                 queueMap,
+		updateInterval:         time.Second,
+		namespace:              "SQS-FARGATE-CONSUMER-V2/SQSConsumer",
+		region:                 "us-west-2",
+		maxDataPoints:          1000,
+		stopChan:               make(chan struct{}),
 	}
 }
 
@@ -202,28 +202,32 @@ func (c *Collector) publishToCloudWatch(ctx context.Context) error {
 	})
 
 	// Collect buffer metrics
-	bufferMetrics := c.GetBufferMetrics()
+	bufferMetrics, ok := c.bufferMetricsCollector.GetMetrics()
+	if !ok {
+		log.Printf("[Collector] Warning: Unable to get buffer metrics for CloudWatch")
+	} else {
 
-	// Queue usage metrics
-	metricData = append(metricData,
-		c.createMetricDatum("BufferHighPriorityUsage", bufferMetrics.HighPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
-		c.createMetricDatum("BufferMediumPriorityUsage", bufferMetrics.MediumPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
-		c.createMetricDatum("BufferLowPriorityUsage", bufferMetrics.LowPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
-	)
+		// Queue usage metrics
+		metricData = append(metricData,
+			c.createMetricDatum("BufferHighPriorityUsage", bufferMetrics.HighPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+			c.createMetricDatum("BufferMediumPriorityUsage", bufferMetrics.MediumPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+			c.createMetricDatum("BufferLowPriorityUsage", bufferMetrics.LowPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+		)
 
-	// Message counts
-	metricData = append(metricData,
-		c.createMetricDatum("BufferTotalSize", float64(bufferMetrics.TotalSize), types.StandardUnitBytes, "Buffer", time.Now()),
-		c.createMetricDatum("BufferMessagesIn", float64(bufferMetrics.TotalMessagesIn), types.StandardUnitCount, "Buffer", time.Now()),
-		c.createMetricDatum("BufferMessagesOut", float64(bufferMetrics.TotalMessagesOut), types.StandardUnitCount, "Buffer", time.Now()),
-		c.createMetricDatum("BufferOverflows", float64(bufferMetrics.OverflowCount), types.StandardUnitCount, "Buffer", time.Now()),
-	)
+		// Message counts
+		metricData = append(metricData,
+			c.createMetricDatum("BufferTotalSize", float64(bufferMetrics.TotalSize), types.StandardUnitBytes, "Buffer", time.Now()),
+			c.createMetricDatum("BufferMessagesIn", float64(bufferMetrics.TotalMessagesIn), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("BufferMessagesOut", float64(bufferMetrics.TotalMessagesOut), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("BufferOverflows", float64(bufferMetrics.OverflowCount), types.StandardUnitCount, "Buffer", time.Now()),
+		)
 
-	// Wait time metrics
-	metricData = append(metricData,
-		c.createMetricDatum("BufferAverageWaitTime", float64(bufferMetrics.AverageWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
-		c.createMetricDatum("BufferMaxWaitTime", float64(bufferMetrics.MaxWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
-	)
+		// Wait time metrics
+		metricData = append(metricData,
+			c.createMetricDatum("BufferAverageWaitTime", float64(bufferMetrics.AverageWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
+			c.createMetricDatum("BufferMaxWaitTime", float64(bufferMetrics.MaxWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
+		)
+	}
 
 	// Wait time histogram
 	for bucket, count := range bufferMetrics.WaitTimeHistogram {
@@ -352,39 +356,6 @@ func getIntAttribute(attrs map[string]string, key string) int64 {
 	return 0
 }
 
-// BufferMetricsEmitter interface implementation
-func (c *Collector) OnMessageEnqueued(message *models.Message) {
-	if c.bufferMetrics != nil {
-		c.bufferMetrics.OnMessageEnqueued(message)
-	}
-}
-
-func (c *Collector) OnMessageDequeued(message *models.Message) {
-	if c.bufferMetrics != nil {
-		c.bufferMetrics.OnMessageDequeued(message)
-	}
-}
-
-func (c *Collector) OnBufferOverflow(priority models.Priority) {
-	if c.bufferMetrics != nil {
-		c.bufferMetrics.OnBufferOverflow(priority)
-	}
-}
-
-func (c *Collector) OnQueueSizeChanged(priority models.Priority, currentSize, capacity int) {
-	if c.bufferMetrics != nil {
-		c.bufferMetrics.OnQueueSizeChanged(priority, currentSize, capacity)
-	}
-}
-
-// BufferMetricsProvider interface implementation
-func (c *Collector) GetBufferMetrics() models.BufferMetrics {
-	if c.bufferMetrics != nil {
-		return c.bufferMetrics.GetMetrics()
-	}
-	return models.BufferMetrics{}
-}
-
 func (c *Collector) GetBufferMetricsCollector() interfaces.BufferMetricsCollector {
-	return c.bufferMetrics
+	return c.bufferMetricsCollector
 }

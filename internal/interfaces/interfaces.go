@@ -59,7 +59,18 @@ type BufferMetricsEmitter interface {
 	OnQueueSizeChanged(priority models.Priority, currentSize, capacity int)
 }
 
+// BufferMetricsCollector defines methods for collecting and accessing buffer metrics
 type BufferMetricsCollector interface {
 	BufferMetricsEmitter
-	GetMetrics() models.BufferMetrics
+
+	// Fast access methods for operational metrics
+	// Returns ok=false if metrics are not available
+	GetBufferUtilization() (high, medium, low float64, ok bool)
+	GetMessageCounts() (in, out int64, ok bool)
+	GetPriorityMessageCounts() (high, medium, low int64, ok bool)
+	GetTotalSize() (size int64, ok bool)
+	GetOverflowCount() (count int32, ok bool)
+
+	// Full metrics for monitoring
+	GetMetrics() (models.BufferMetrics, bool) // returns ok=false if metrics not available
 }

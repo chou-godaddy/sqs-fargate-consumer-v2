@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"sqs-fargate-consumer-v2/internal/config"
 	"sqs-fargate-consumer-v2/internal/interfaces"
 	"sqs-fargate-consumer-v2/internal/models"
@@ -17,6 +16,7 @@ import (
 )
 
 type ConsumerGroup struct {
+	instanceID             string
 	config                 config.ConsumerConfig
 	sqsClient              *sqs.Client
 	scheduler              interfaces.Scheduler
@@ -26,11 +26,17 @@ type ConsumerGroup struct {
 
 	workers     map[string]*Consumer
 	workerCount atomic.Int32
-	mu          sync.RWMutex
+	workerMu    sync.RWMutex
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 	wg         sync.WaitGroup
+
+	lastScaleUpTime     atomic.Int64
+	lastScaleDownTime   atomic.Int64
+	lastSuccessfulScale atomic.Int64
+	scalingMu           sync.Mutex
+	scalingInProgress   atomic.Bool
 }
 
 type Consumer struct {
@@ -38,8 +44,9 @@ type Consumer struct {
 	queueURL string
 	status   atomic.Int32
 	msgCount atomic.Int64
-	lastPoll time.Time
+	lastPoll atomic.Int64
 	stopChan chan struct{}
+	stopped  atomic.Bool
 }
 
 const (
@@ -56,8 +63,11 @@ func NewConsumerGroup(
 	collector interfaces.MetricsCollector,
 	bufferMetricsCollector interfaces.BufferMetricsCollector,
 ) *ConsumerGroup {
+	instanceID := fmt.Sprintf("consumer-group-%d", time.Now().UnixNano())
+	log.Printf("[ConsumerGroup] Creating new instance: %s", instanceID)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ConsumerGroup{
+		instanceID:             instanceID,
 		config:                 config,
 		sqsClient:              sqsClient,
 		scheduler:              scheduler,
@@ -87,8 +97,8 @@ func (cg *ConsumerGroup) Start(ctx context.Context) error {
 }
 
 func (cg *ConsumerGroup) startWorker() error {
-	cg.mu.Lock()
-	defer cg.mu.Unlock()
+	cg.workerMu.Lock()
+	defer cg.workerMu.Unlock()
 
 	if cg.workerCount.Load() >= int32(cg.config.MaxWorkers) {
 		return fmt.Errorf("maximum worker count reached")
@@ -106,18 +116,28 @@ func (cg *ConsumerGroup) startWorker() error {
 	cg.wg.Add(1)
 	go cg.runWorker(consumer)
 
-	log.Printf("[ConsumerGroup] Started new worker %s. Total workers: %d",
-		workerID, cg.workerCount.Load())
+	log.Printf("[ConsumerGroup] Started new worker %s. Total workers: %d", workerID, cg.workerCount.Load())
 	return nil
 }
 
 func (cg *ConsumerGroup) runWorker(consumer *Consumer) {
-	defer cg.wg.Done()
 	defer func() {
-		cg.mu.Lock()
-		delete(cg.workers, consumer.id)
-		cg.mu.Unlock()
-		cg.workerCount.Add(-1)
+		cg.wg.Done()
+		cg.workerMu.Lock()
+		if _, exists := cg.workers[consumer.id]; exists {
+			delete(cg.workers, consumer.id)
+			// Only decrement count if this wasn't an explicit stop
+			if !consumer.stopped.Load() {
+				cg.workerCount.Add(-1)
+				log.Printf("[ConsumerGroup] Worker %s exited naturally, new count: %d",
+					consumer.id, cg.workerCount.Load())
+			}
+		}
+		cg.workerMu.Unlock()
+
+		if r := recover(); r != nil {
+			log.Printf("[ConsumerGroup] Recovered from panic in worker %s: %v", consumer.id, r)
+		}
 	}()
 
 	for {
@@ -135,24 +155,40 @@ func (cg *ConsumerGroup) runWorker(consumer *Consumer) {
 	}
 }
 
+func (cg *ConsumerGroup) shouldThrottleForPriority(priority int, consumer *Consumer) (bool, float64) {
+	high, medium, low, ok := cg.bufferMetricsCollector.GetBufferUtilization()
+	if !ok {
+		return true, 0 // Throttle if we can't get metrics
+	}
+
+	var bufferUsage float64
+	switch priority {
+	case 3:
+		bufferUsage = high
+	case 2:
+		bufferUsage = medium
+	case 1:
+		bufferUsage = low
+	}
+
+	if bufferUsage > cg.config.ScaleThreshold {
+		log.Printf("[Consumer %s] Priority %d buffer pressure (%.2f%%), backing off",
+			consumer.id, priority, bufferUsage*100)
+		return true, bufferUsage
+	}
+
+	return false, bufferUsage
+}
+
 func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
-	// Get buffer metrics
-	bufferMetrics := cg.bufferMetricsCollector.GetMetrics()
-
-	// Check buffer utilization before polling
-	bufferUsage := float64(bufferMetrics.TotalMessagesIn-
-		bufferMetrics.TotalMessagesOut) / float64(bufferMetrics.TotalSize)
-
-	if bufferUsage > 0.9 {
-		// Back off when buffer is near full
-		time.Sleep(500 * time.Millisecond)
+	// Check minimum poll interval
+	lastPollTime := time.Unix(0, consumer.lastPoll.Load())
+	if time.Since(lastPollTime) < cg.config.MinPollInterval.Duration {
+		time.Sleep(cg.config.MinPollInterval.Duration - time.Since(lastPollTime))
 		return nil
 	}
 
-	consumer.status.Store(consumerStatusPolling)
-	defer consumer.status.Store(consumerStatusIdle)
-
-	// Select queue to poll
+	// Get queue from scheduler
 	queue, err := cg.scheduler.SelectQueue()
 	if err != nil {
 		return fmt.Errorf("selecting queue: %w", err)
@@ -162,7 +198,23 @@ func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
 		return nil
 	}
 
-	// Poll messages
+	// Set status to polling since we have a queue to work on
+	if !consumer.status.CompareAndSwap(consumerStatusIdle, consumerStatusPolling) {
+		return nil
+	}
+	defer consumer.status.Store(consumerStatusIdle)
+
+	// Check if we should throttle for this priority
+	if shouldThrottle, bufferUsage := cg.shouldThrottleForPriority(queue.Priority, consumer); shouldThrottle {
+		time.Sleep(time.Duration(float64(cg.config.PollBackoffInterval.Duration) * bufferUsage))
+		return nil
+	}
+
+	// Poll and process messages
+	return cg.pollQueue(consumer, queue)
+}
+
+func (cg *ConsumerGroup) pollQueue(consumer *Consumer, queue *config.QueueConfig) error {
 	result, err := cg.sqsClient.ReceiveMessage(cg.ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            &queue.URL,
 		MaxNumberOfMessages: int32(cg.config.MaxBatchSize),
@@ -171,25 +223,16 @@ func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
 			"ApproximateReceiveCount",
 			"SentTimestamp",
 		},
-		// Add MessageAttributeNames to get any custom attributes
 		MessageAttributeNames: []string{"All"},
 	})
+
 	if err != nil {
-		return fmt.Errorf("failed to receive messages: %v", err)
+		return fmt.Errorf("failed to receive messages: %w", err)
 	}
 
-	// Process received messages
+	messageCount := 0
 	for _, msg := range result.Messages {
-		message := &models.Message{
-			QueueURL:      queue.URL,
-			QueueName:     queue.Name,
-			Priority:      models.Priority(queue.Priority),
-			MessageID:     *msg.MessageId,
-			Body:          []byte(*msg.Body),
-			ReceiptHandle: msg.ReceiptHandle,
-			Size:          int64(len(*msg.Body)),
-			ReceivedAt:    time.Now(),
-		}
+		message := models.NewMessage(&msg, queue.URL, queue.Name, models.Priority(queue.Priority))
 
 		if err := cg.buffer.Push(message); err != nil {
 			log.Printf("[Consumer %s] Failed to buffer message %s: %v",
@@ -197,11 +240,15 @@ func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
 			continue
 		}
 
-		consumer.msgCount.Add(1)
-		consumer.lastPoll = time.Now()
+		messageCount++
 	}
 
-	log.Printf("[Consumer %s] Polled %d messages from queue %s and pushed to message buffer", consumer.id, len(result.Messages), queue.Name)
+	if messageCount > 0 {
+		consumer.msgCount.Add(int64(messageCount))
+		consumer.lastPoll.Store(time.Now().UnixNano())
+		log.Printf("[Consumer %s] Successfully buffered %d messages from queue %s (Priority: %d)",
+			consumer.id, messageCount, queue.Name, queue.Priority)
+	}
 
 	return nil
 }
@@ -215,100 +262,159 @@ func (cg *ConsumerGroup) monitorAndScale() {
 		case <-cg.ctx.Done():
 			return
 		case <-ticker.C:
-			totalMessages := int64(0)
-			totalInFlight := int64(0)
-			avgProcessingTime := float64(0)
-			activeQueues := 0
-
-			// Calculate metrics across all queues
-			for _, queueConfig := range cg.config.Queues {
-				if metrics := cg.collector.GetQueueMetrics(queueConfig.Name); metrics != nil {
-					totalMessages += metrics.MessageCount
-					totalInFlight += metrics.InFlightCount
-					if metrics.ProcessedCount.Load() > 0 {
-						avgProcessingTime += float64(metrics.ProcessingTime.Load()) / float64(metrics.ProcessedCount.Load())
-						activeQueues++
-					}
-				}
+			// Get current time stamp for this scaling attempt
+			now := time.Now()
+			lastScale := time.Unix(0, cg.lastSuccessfulScale.Load())
+			if time.Since(lastScale) < cg.config.ScaleInterval.Duration {
+				continue // Skip this tick if not enough time has passed
 			}
 
-			if activeQueues > 0 {
-				avgProcessingTime /= float64(activeQueues)
-			}
-
-			currentWorkers := cg.workerCount.Load()
-			bufferMetrics := cg.bufferMetricsCollector.GetMetrics()
-			desiredWorkers := calculateDesiredWorkers(
-				totalMessages,
-				totalInFlight,
-				avgProcessingTime,
-				cg.config,
-				bufferMetrics,
-			)
-
-			// Apply scaling decisions
-			if desiredWorkers > int64(currentWorkers) {
-				for i := 0; i < min(int(desiredWorkers-int64(currentWorkers)), 3); i++ {
-					if err := cg.startWorker(); err != nil {
-						log.Printf("[ConsumerGroup] Failed to scale up: %v", err)
-						break
-					}
-				}
-			} else if desiredWorkers < int64(currentWorkers) && currentWorkers > int32(cg.config.MinWorkers) {
-				cg.stopWorker()
+			// If we can acquire the scaling lock, proceed
+			if cg.scalingInProgress.CompareAndSwap(false, true) {
+				cg.lastSuccessfulScale.Store(now.UnixNano())
+				cg.adjustWorkerCount()
+				cg.scalingInProgress.Store(false)
 			}
 		}
 	}
 }
 
-func calculateDesiredWorkers(totalMessages, inFlight int64, avgProcessingTime float64, config config.ConsumerConfig, bufferMetrics models.BufferMetrics) int64 {
-	// Check buffer capacity first
-	bufferCapacity := float64(bufferMetrics.HighPriorityUsage +
-		bufferMetrics.MediumPriorityUsage +
-		bufferMetrics.LowPriorityUsage)
+func (cg *ConsumerGroup) shouldScale(highUsage, mediumUsage, lowUsage float64, messagesIn, messagesOut int64) int {
+	maxBufferUsage := max(highUsage, max(mediumUsage, lowUsage))
+	currentWorkers := cg.workerCount.Load()
 
-	bufferUsage := float64(bufferMetrics.TotalMessagesIn-
-		bufferMetrics.TotalMessagesOut) / bufferCapacity
-
-	// If buffer is near capacity, reduce workers
-	if bufferUsage > 0.9 {
-		return max(int64(config.MinWorkers), int64(float64(config.MaxWorkers)*(1-bufferUsage)))
+	// Check cooldown periods
+	now := time.Now()
+	if time.Unix(0, cg.lastScaleUpTime.Load()).Add(cg.config.ScaleUpCoolDown.Duration).After(now) {
+		return 0
+	}
+	if time.Unix(0, cg.lastScaleDownTime.Load()).Add(cg.config.ScaleDownCoolDown.Duration).After(now) {
+		return 0
 	}
 
-	// Calculate processing capacity needed
-	if totalMessages == 0 && inFlight == 0 {
-		return int64(config.MinWorkers)
+	// Emergency scale down takes precedence
+	if maxBufferUsage > cg.config.ScaleThreshold {
+		log.Printf("[ConsumerGroup] Emergency scale down - buffer usage %.2f%% above threshold. Current workers: %d",
+			maxBufferUsage*100, currentWorkers)
+		return -1
 	}
 
-	// Available buffer capacity
-	availableBuffer := int64((1 - bufferUsage) * bufferCapacity)
+	// Regular scaling conditions
+	if messagesIn == messagesOut {
+		if maxBufferUsage < cg.config.ScaleThreshold/3 {
+			log.Printf("[ConsumerGroup] Scale down - no backlog and low buffer usage (%.2f%%). Current workers: %d",
+				maxBufferUsage*100, currentWorkers)
+			return -1
+		}
+	} else if messagesIn > messagesOut {
+		if maxBufferUsage < cg.config.ScaleThreshold {
+			log.Printf("[ConsumerGroup] Scale up - has backlog and buffer space (%.2f%%). Current workers: %d",
+				maxBufferUsage*100, currentWorkers)
+			return 1
+		}
+	}
 
-	// Calculate based on processing capacity and available buffer
-	messagesPerWorkerPerSecond := 1000.0 / max(avgProcessingTime, 100.0)
+	return 0
+}
 
-	// Consider both queue depth and buffer availability
-	effectiveWorkload := min(
-		float64(totalMessages+inFlight),
-		float64(availableBuffer),
-	)
+func (cg *ConsumerGroup) adjustWorkerCount() {
+	cg.scalingMu.Lock()
+	defer cg.scalingMu.Unlock()
 
-	desiredWorkers := int64(math.Ceil(effectiveWorkload /
-		(messagesPerWorkerPerSecond * float64(config.ScaleInterval.Seconds()))))
+	high, medium, low, ok := cg.bufferMetricsCollector.GetBufferUtilization()
+	if !ok {
+		return
+	}
 
-	// Apply bounds
-	return max(int64(config.MinWorkers), min(desiredWorkers, int64(config.MaxWorkers)))
+	messagesIn, messagesOut, ok := cg.bufferMetricsCollector.GetMessageCounts()
+	if !ok {
+		return
+	}
+
+	scale := cg.shouldScale(high, medium, low, messagesIn, messagesOut)
+	currentWorkers := cg.workerCount.Load()
+	now := time.Now()
+
+	workersBefore := cg.workerCount.Load()
+	log.Printf("[ConsumerGroup %s] Scaling check - Current workers: %d, Scale direction: %d",
+		cg.instanceID, workersBefore, scale)
+
+	switch scale {
+	case 1: // Scale up
+		currentWorkers = cg.workerCount.Load() // Get fresh count
+		if currentWorkers >= int32(cg.config.MaxWorkers) {
+			return
+		}
+
+		workersToAdd := min(
+			cg.config.ScaleUpStep,
+			int(int32(cg.config.MaxWorkers)-currentWorkers),
+		)
+
+		if workersToAdd > 0 {
+			for i := 0; i < workersToAdd; i++ {
+				if err := cg.startWorker(); err != nil {
+					break
+				}
+			}
+			cg.lastScaleUpTime.Store(now.UnixNano())
+			log.Printf("[ConsumerGroup] Scaled up by %d workers. New count: %d",
+				workersToAdd, cg.workerCount.Load())
+		}
+
+	case -1: // Scale down
+		currentWorkers = cg.workerCount.Load() // Get fresh count
+		if currentWorkers <= int32(cg.config.MinWorkers) {
+			log.Printf("[ConsumerGroup] Cannot scale down: at minimum workers (%d)", currentWorkers)
+			return
+		}
+
+		workersToRemove := min(
+			cg.config.ScaleDownStep,
+			int(currentWorkers-int32(cg.config.MinWorkers)),
+		)
+
+		log.Printf("[ConsumerGroup] Attempting to remove %d workers from current count %d",
+			workersToRemove, currentWorkers)
+
+		if workersToRemove > 0 {
+			successfullyRemoved := 0
+			for i := 0; i < workersToRemove; i++ {
+				beforeCount := cg.workerCount.Load()
+				cg.stopWorker()
+				afterCount := cg.workerCount.Load()
+				if afterCount < beforeCount {
+					successfullyRemoved++
+				}
+			}
+			if successfullyRemoved > 0 {
+				cg.lastScaleDownTime.Store(now.UnixNano())
+				log.Printf("[ConsumerGroup] Successfully scaled down by %d workers. New count: %d",
+					successfullyRemoved, cg.workerCount.Load())
+			}
+		}
+	}
 }
 
 func (cg *ConsumerGroup) stopWorker() {
-	cg.mu.Lock()
-	defer cg.mu.Unlock()
+	cg.workerMu.Lock()
+	defer cg.workerMu.Unlock()
 
-	// Find an idle worker to stop
-	for _, worker := range cg.workers {
+	for id, worker := range cg.workers {
 		if worker.status.Load() == consumerStatusIdle {
-			close(worker.stopChan)
-			log.Printf("[ConsumerGroup] Stopped worker %s", worker.id)
-			return
+			select {
+			case <-worker.stopChan: // Channel already closed
+				continue
+			default:
+				if worker.stopped.CompareAndSwap(false, true) {
+					close(worker.stopChan)
+					delete(cg.workers, id)
+					cg.workerCount.Add(-1)
+					log.Printf("[ConsumerGroup] Stopped worker %s, new count: %d",
+						id, cg.workerCount.Load())
+					return
+				}
+			}
 		}
 	}
 }
@@ -317,14 +423,17 @@ func (cg *ConsumerGroup) Shutdown(ctx context.Context) error {
 	log.Printf("[ConsumerGroup] Initiating shutdown...")
 	cg.cancelFunc()
 
-	// Stop all workers
-	cg.mu.Lock()
+	cg.workerMu.Lock()
 	for _, worker := range cg.workers {
-		close(worker.stopChan)
+		select {
+		case <-worker.stopChan:
+			continue
+		default:
+			close(worker.stopChan)
+		}
 	}
-	cg.mu.Unlock()
+	cg.workerMu.Unlock()
 
-	// Wait for workers to finish with timeout
 	done := make(chan struct{})
 	go func() {
 		cg.wg.Wait()
@@ -333,9 +442,9 @@ func (cg *ConsumerGroup) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("consumer group shutdown timed out: %w", ctx.Err())
 	case <-done:
-		log.Printf("[ConsumerGroup] Shutdown completed")
+		log.Printf("[ConsumerGroup] Shutdown completed successfully")
 		return nil
 	}
 }

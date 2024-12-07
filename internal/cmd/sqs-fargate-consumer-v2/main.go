@@ -57,15 +57,15 @@ func main() {
 		}
 	}()
 
-	// Create metrics collector
-	collector := metrics.NewCollector(dep.SQSClient, dep.CloudwatchClient, cfg.Consumer.Queues)
-
 	// Create message buffer
 	buffer := consumer.NewMessageBuffer(cfg.Buffer)
 
-	bufferMetrcisCollector := collector.GetBufferMetricsCollector()
+	bufferMetrcisCollector := metrics.NewBufferMetricsCollector()
 
 	buffer.SetMetricsEmitter(bufferMetrcisCollector)
+
+	// Create metrics collector
+	collector := metrics.NewCollector(dep.SQSClient, dep.CloudwatchClient, cfg.Consumer.Queues, bufferMetrcisCollector)
 
 	// Create scheduler
 	scheduler := scheduler.NewScheduler(cfg.Consumer.Queues, collector)
@@ -81,7 +81,7 @@ func main() {
 	defer cancel()
 
 	// Start components
-	startComponents(ctx, collector, consumerGroup, processor)
+	startComponents(ctx, collector, buffer, consumerGroup, processor)
 
 	// Wait for shutdown signal
 	handleGracefulShutdown(cancel, collector, consumerGroup, processor)

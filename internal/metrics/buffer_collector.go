@@ -1,6 +1,10 @@
 package metrics
 
 import (
+	"fmt"
+	"log"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,64 +13,140 @@ import (
 )
 
 type BufferMetricsCollector struct {
-	// Metrics storage
-	totalSize           atomic.Int64
-	overflowCount       atomic.Int32
-	totalMessagesIn     atomic.Int64
-	totalMessagesOut    atomic.Int64
-	messagesPerPriority map[models.Priority]*atomic.Int64
+	// Frequently accessed metrics - atomic values
+	highPriorityLength     atomic.Int64
+	mediumPriorityLength   atomic.Int64
+	lowPriorityLength      atomic.Int64
+	highPriorityCapacity   atomic.Int64
+	mediumPriorityCapacity atomic.Int64
+	lowPriorityCapacity    atomic.Int64
+	totalMessagesIn        atomic.Int64
+	totalMessagesOut       atomic.Int64
+	totalSize              atomic.Int64
+	highPriorityMessages   atomic.Int64
+	mediumPriorityMessages atomic.Int64
+	lowPriorityMessages    atomic.Int64
+	overflowCount          atomic.Int32
 
-	// Queue usage tracking
-	highPriorityUsage   atomic.Int64
-	mediumPriorityUsage atomic.Int64
-	lowPriorityUsage    atomic.Int64
-
-	// Wait time tracking
-	waitTimes    []time.Duration
-	waitTimeIdx  int
-	maxWaitTimes int
-	waitTimeMu   sync.RWMutex
-
-	// Last update tracking
-	lastMetricsUpdate time.Time
-	mu                sync.RWMutex
+	// Metrics for monitoring - protected by mutex
+	mu                     sync.RWMutex
+	messageWaitTimes       map[string]time.Time
+	waitTimeHistogram      map[string]int64
+	lastProcessingRateCalc time.Time
 }
 
 func NewBufferMetricsCollector() *BufferMetricsCollector {
 	return &BufferMetricsCollector{
-		messagesPerPriority: map[models.Priority]*atomic.Int64{
-			models.PriorityHigh:   {},
-			models.PriorityMedium: {},
-			models.PriorityLow:    {},
-		},
-		maxWaitTimes:      1000,
-		waitTimes:         make([]time.Duration, 1000),
-		lastMetricsUpdate: time.Now(),
+		messageWaitTimes:  make(map[string]time.Time),
+		waitTimeHistogram: make(map[string]int64),
 	}
 }
 
-func (c *BufferMetricsCollector) OnMessageEnqueued(msg *models.Message) {
-	if msg == nil {
-		return
+// Fast access methods for operational metrics
+func (c *BufferMetricsCollector) GetBufferUtilization() (high, medium, low float64, ok bool) {
+	if c == nil {
+		return 0, 0, 0, false
 	}
 
-	c.totalSize.Add(msg.Size)
+	highLen := float64(c.highPriorityLength.Load())
+	medLen := float64(c.mediumPriorityLength.Load())
+	lowLen := float64(c.lowPriorityLength.Load())
+
+	highCap := float64(c.highPriorityCapacity.Load())
+	medCap := float64(c.mediumPriorityCapacity.Load())
+	lowCap := float64(c.lowPriorityCapacity.Load())
+
+	// If no capacities are set, metrics aren't initialized
+	if highCap == 0 && medCap == 0 && lowCap == 0 {
+		return 0, 0, 0, false
+	}
+
+	if highCap > 0 {
+		high = highLen / highCap
+	}
+	if medCap > 0 {
+		medium = medLen / medCap
+	}
+	if lowCap > 0 {
+		low = lowLen / lowCap
+	}
+
+	return high, medium, low, true
+}
+
+func (c *BufferMetricsCollector) GetMessageCounts() (in, out int64, ok bool) {
+	if c == nil {
+		return 0, 0, false
+	}
+	in = c.totalMessagesIn.Load()
+	out = c.totalMessagesOut.Load()
+	if in == 0 && out == 0 {
+		log.Printf("[BufferMetricsCollector] Warning: Both in/out counts are 0. Called from: %s",
+			identifyStackTrace()) // Add helper to get caller info
+	}
+	return in, out, true
+}
+
+func (c *BufferMetricsCollector) GetPriorityMessageCounts() (high, medium, low int64, ok bool) {
+	if c == nil {
+		return 0, 0, 0, false
+	}
+	return c.highPriorityMessages.Load(), c.mediumPriorityMessages.Load(), c.lowPriorityMessages.Load(), true
+}
+
+func (c *BufferMetricsCollector) GetTotalSize() (size int64, ok bool) {
+	if c == nil {
+		return 0, false
+	}
+	return c.totalSize.Load(), true
+}
+
+func (c *BufferMetricsCollector) GetOverflowCount() (count int32, ok bool) {
+	if c == nil {
+		return 0, false
+	}
+	return c.overflowCount.Load(), true
+}
+
+// BufferMetricsEmitter interface implementation
+func (c *BufferMetricsCollector) OnMessageEnqueued(message *models.Message) {
+	prevIn := c.totalMessagesIn.Load()
 	c.totalMessagesIn.Add(1)
-	c.messagesPerPriority[msg.Priority].Add(1)
+	log.Printf("[BufferMetricsCollector] Message enqueued. In count: %d -> %d",
+		prevIn, c.totalMessagesIn.Load())
+	c.totalSize.Add(message.Size)
+
+	switch message.Priority {
+	case models.PriorityHigh:
+		c.highPriorityMessages.Add(1)
+	case models.PriorityMedium:
+		c.mediumPriorityMessages.Add(1)
+	case models.PriorityLow:
+		c.lowPriorityMessages.Add(1)
+	}
+
+	// Track wait time
+	c.mu.Lock()
+	c.messageWaitTimes[message.MessageID] = time.Now()
+	c.mu.Unlock()
 }
 
-func (c *BufferMetricsCollector) OnMessageDequeued(msg *models.Message) {
-	if msg == nil {
-		return
-	}
-
-	c.totalSize.Add(-msg.Size)
+func (c *BufferMetricsCollector) OnMessageDequeued(message *models.Message) {
+	prevOut := c.totalMessagesOut.Load()
 	c.totalMessagesOut.Add(1)
+	log.Printf("[BufferMetricsCollector] Message dequeued. Out count: %d -> %d",
+		prevOut, c.totalMessagesOut.Load())
+	c.totalSize.Add(-message.Size)
 
-	if !msg.EnqueuedAt.IsZero() {
-		waitTime := time.Since(msg.EnqueuedAt)
-		c.recordWaitTime(waitTime)
+	// Update wait time metrics
+	c.mu.Lock()
+	if enqueueTime, exists := c.messageWaitTimes[message.MessageID]; exists {
+		waitTime := time.Since(enqueueTime)
+		bucket := getWaitTimeBucket(waitTime)
+		c.waitTimeHistogram[bucket]++
+		delete(c.messageWaitTimes, message.MessageID)
 	}
+	c.mu.Unlock()
 }
 
 func (c *BufferMetricsCollector) OnBufferOverflow(priority models.Priority) {
@@ -74,112 +154,122 @@ func (c *BufferMetricsCollector) OnBufferOverflow(priority models.Priority) {
 }
 
 func (c *BufferMetricsCollector) OnQueueSizeChanged(priority models.Priority, currentSize, capacity int) {
-	if capacity == 0 {
-		return
-	}
-	// Store as parts per million (ppm) for better precision
-	usage := int64((float64(currentSize) / float64(capacity)) * 1_000_000)
-
 	switch priority {
 	case models.PriorityHigh:
-		c.highPriorityUsage.Store(usage)
+		c.highPriorityLength.Store(int64(currentSize))
+		c.highPriorityCapacity.Store(int64(capacity))
 	case models.PriorityMedium:
-		c.mediumPriorityUsage.Store(usage)
+		c.mediumPriorityLength.Store(int64(currentSize))
+		c.mediumPriorityCapacity.Store(int64(capacity))
 	case models.PriorityLow:
-		c.lowPriorityUsage.Store(usage)
+		c.lowPriorityLength.Store(int64(currentSize))
+		c.lowPriorityCapacity.Store(int64(capacity))
 	}
 }
 
-func (c *BufferMetricsCollector) recordWaitTime(waitTime time.Duration) {
-	c.waitTimeMu.Lock()
-	defer c.waitTimeMu.Unlock()
-
-	c.waitTimes[c.waitTimeIdx] = waitTime
-	c.waitTimeIdx = (c.waitTimeIdx + 1) % c.maxWaitTimes
-}
-
-func (c *BufferMetricsCollector) calculateWaitTimeMetrics() (time.Duration, time.Duration, map[string]int64) {
-	c.waitTimeMu.RLock()
-	defer c.waitTimeMu.RUnlock()
-
-	if len(c.waitTimes) == 0 {
-		return 0, 0, make(map[string]int64)
+// GetMetrics returns all metrics for monitoring/CloudWatch
+func (c *BufferMetricsCollector) GetMetrics() (models.BufferMetrics, bool) {
+	if c == nil {
+		return models.BufferMetrics{}, false
 	}
 
-	var total time.Duration
-	var max time.Duration
-	histogram := make(map[string]int64)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	count := 0
-	for _, wt := range c.waitTimes {
-		if wt == 0 { // Skip empty slots
-			continue
-		}
+	// Calculate wait time metrics safely
+	var avgWaitTime time.Duration
+	var maxWaitTime time.Duration
+	now := time.Now()
 
-		count++
-		total += wt
-		if wt > max {
-			max = wt
+	waitTimeCount := len(c.messageWaitTimes)
+	if waitTimeCount > 0 {
+		var totalWait time.Duration
+		for _, enqueueTime := range c.messageWaitTimes {
+			wait := now.Sub(enqueueTime)
+			totalWait += wait
+			if wait > maxWaitTime {
+				maxWaitTime = wait
+			}
 		}
-
-		// Update histogram
-		switch {
-		case wt < 100*time.Millisecond:
-			histogram["0-100ms"]++
-		case wt < 500*time.Millisecond:
-			histogram["100-500ms"]++
-		case wt < time.Second:
-			histogram["500-1000ms"]++
-		case wt < 5*time.Second:
-			histogram["1s-5s"]++
-		case wt < 10*time.Second:
-			histogram["5s-10s"]++
-		default:
-			histogram["10s+"]++
-		}
+		avgWaitTime = totalWait / time.Duration(waitTimeCount)
 	}
 
-	if count == 0 {
-		return 0, 0, histogram
+	// Calculate processing rate safely
+	var processingRate float64
+	if !c.lastProcessingRateCalc.IsZero() {
+		duration := now.Sub(c.lastProcessingRateCalc).Seconds()
+		if duration > 0 {
+			processingRate = float64(c.totalMessagesOut.Load()) / duration
+		}
+	}
+	c.lastProcessingRateCalc = now
+
+	// Get real-time metrics
+	high, medium, low, ok := c.GetBufferUtilization()
+	if !ok {
+		return models.BufferMetrics{}, false
 	}
 
-	return total / time.Duration(count), max, histogram
-}
+	// Create copy of wait time histogram
+	histogramCopy := make(map[string]int64, len(c.waitTimeHistogram))
+	for k, v := range c.waitTimeHistogram {
+		histogramCopy[k] = v
+	}
 
-func (c *BufferMetricsCollector) GetMetrics() models.BufferMetrics {
-	// Minizime locking by collecting all metrics without locks first
-	metrics := models.BufferMetrics{
-		HighPriorityUsage:      float64(c.highPriorityUsage.Load()) / 1_000_000,
-		MediumPriorityUsage:    float64(c.mediumPriorityUsage.Load()) / 1_000_000,
-		LowPriorityUsage:       float64(c.lowPriorityUsage.Load()) / 1_000_000,
+	return models.BufferMetrics{
+		HighPriorityUsage:      high,
+		MediumPriorityUsage:    medium,
+		LowPriorityUsage:       low,
 		TotalSize:              c.totalSize.Load(),
-		OverflowCount:          c.overflowCount.Load(),
 		TotalMessagesIn:        c.totalMessagesIn.Load(),
 		TotalMessagesOut:       c.totalMessagesOut.Load(),
-		HighPriorityMessages:   c.messagesPerPriority[models.PriorityHigh].Load(),
-		MediumPriorityMessages: c.messagesPerPriority[models.PriorityMedium].Load(),
-		LowPriorityMessages:    c.messagesPerPriority[models.PriorityLow].Load(),
+		HighPriorityMessages:   c.highPriorityMessages.Load(),
+		MediumPriorityMessages: c.mediumPriorityMessages.Load(),
+		LowPriorityMessages:    c.lowPriorityMessages.Load(),
+		OverflowCount:          c.overflowCount.Load(),
+		AverageWaitTime:        avgWaitTime,
+		MaxWaitTime:            maxWaitTime,
+		WaitTimeHistogram:      histogramCopy,
+		MessageProcessingRate:  processingRate,
+		LastUpdateTime:         now,
+	}, true
+}
+
+func getWaitTimeBucket(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return "0-1s"
+	case d < 5*time.Second:
+		return "1-5s"
+	case d < 10*time.Second:
+		return "5-10s"
+	case d < 30*time.Second:
+		return "10-30s"
+	case d < time.Minute:
+		return "30-60s"
+	default:
+		return ">60s"
 	}
+}
 
-	// Only lock for wait time calculations
-	c.waitTimeMu.RLock()
-	avgWait, maxWait, histogram := c.calculateWaitTimeMetrics()
-	c.waitTimeMu.RUnlock()
-
-	metrics.AverageWaitTime = avgWait
-	metrics.MaxWaitTime = maxWait
-	metrics.WaitTimeHistogram = histogram
-
-	// Short lock just for updating the last metrics time
-	c.mu.Lock()
-	timeSinceLastUpdate := time.Since(c.lastMetricsUpdate)
-	c.lastMetricsUpdate = time.Now()
-	c.mu.Unlock()
-
-	// Calculate rate after releasing lock
-	if timeSinceLastUpdate > 0 {
-		metrics.MessageProcessingRate = float64(metrics.TotalMessagesOut) / timeSinceLastUpdate.Seconds()
+func identifyStackTrace() string {
+	pc := make([]uintptr, 10)
+	n := runtime.Callers(2, pc)
+	if n == 0 {
+		return "unknown"
 	}
-
-	return metrics
+	pc = pc[:n]
+	frames := runtime.CallersFrames(pc)
+	var trace strings.Builder
+	for {
+		frame, more := frames.Next()
+		if !strings.Contains(frame.Function, "runtime.") {
+			trace.WriteString(fmt.Sprintf("%s:%d", frame.Function, frame.Line))
+			break
+		}
+		if !more {
+			break
+		}
+	}
+	return trace.String()
 }

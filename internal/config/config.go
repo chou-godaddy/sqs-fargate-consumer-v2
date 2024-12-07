@@ -14,13 +14,18 @@ import (
 )
 
 type ConsumerConfig struct {
-	MaxWorkers     int           `json:"maxWorkers"`
-	MinWorkers     int           `json:"minWorkers"`
-	PollInterval   Duration      `json:"pollInterval"`
-	MaxBatchSize   int           `json:"maxBatchSize"`
-	ScaleInterval  Duration      `json:"scaleInterval"`
-	ScaleThreshold float64       `json:"scaleThreshold"`
-	Queues         []QueueConfig `json:"queues"`
+	MaxWorkers          int           `json:"maxWorkers"`
+	MinWorkers          int           `json:"minWorkers"`
+	MinPollInterval     Duration      `json:"minpollInterval"`
+	PollBackoffInterval Duration      `json:"pollBackoffInterval"`
+	MaxBatchSize        int           `json:"maxBatchSize"`
+	ScaleInterval       Duration      `json:"scaleInterval"`
+	ScaleThreshold      float64       `json:"scaleThreshold"`
+	ScaleUpCoolDown     Duration      `json:"scaleUpCoolDown"`
+	ScaleDownCoolDown   Duration      `json:"scaleDownCoolDown"`
+	ScaleUpStep         int           `json:"scaleUpStep"`
+	ScaleDownStep       int           `json:"scaleDownStep"`
+	Queues              []QueueConfig `json:"queues"`
 }
 
 type BufferConfig struct {
