@@ -37,13 +37,6 @@ type Scheduler interface {
 	SelectQueue() (*config.QueueConfig, error)
 }
 
-// Worker represents a generic worker interface
-type Worker interface {
-	Start(context.Context) error
-	Stop()
-	GetMetrics() models.WorkerMetrics
-}
-
 // MessageProcessor defines the interface for processing messages from the buffer
 type MessageProcessor interface {
 	Component
@@ -63,7 +56,7 @@ type BufferMetricsEmitter interface {
 type BufferMetricsCollector interface {
 	BufferMetricsEmitter
 
-	// Fast access methods for operational metrics
+	// Fast access methods for operational metrics, atomic values retrieval
 	// Returns ok=false if metrics are not available
 	GetBufferUtilization() (high, medium, low float64, ok bool)
 	GetMessageCounts() (in, out int64, ok bool)
@@ -71,6 +64,6 @@ type BufferMetricsCollector interface {
 	GetTotalSize() (size int64, ok bool)
 	GetOverflowCount() (count int32, ok bool)
 
-	// Full metrics for monitoring
+	// Full metrics for monitoring, mutex-protected
 	GetMetrics() (models.BufferMetrics, bool) // returns ok=false if metrics not available
 }

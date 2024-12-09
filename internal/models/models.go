@@ -39,20 +39,12 @@ type Message struct {
 	RetryCount    int
 }
 
-// WorkerMetrics represents worker-specific metrics
-type WorkerMetrics struct {
-	ID           string
-	Status       int32
-	MessageCount int64
-	LastActive   time.Time
-}
-
 // BufferMetrics represents buffer utilization metrics
 type BufferMetrics struct {
-	// Queue utilization metrics
-	HighPriorityUsage   float64 // Percentage of high priority queue capacity used (0-1)
-	MediumPriorityUsage float64 // Percentage of medium priority queue capacity used (0-1)
-	LowPriorityUsage    float64 // Percentage of low priority queue capacity used (0-1)
+	// Channel utilization metrics
+	HighPriorityUsage   float64 // Percentage of high priority channel capacity used (0-1)
+	MediumPriorityUsage float64 // Percentage of medium priority channel capacity used (0-1)
+	LowPriorityUsage    float64 // Percentage of low priority channel capacity used (0-1)
 
 	// Message counts
 	TotalSize              int64 // Total size of all messages currently in buffer
@@ -93,6 +85,7 @@ const (
 	PriorityHigh
 )
 
+// NewMessage creates a new buffer message from an SQS message
 func NewMessage(sqsMsg *types.Message, queueURL, queueName string, priority Priority) *Message {
 	return &Message{
 		QueueURL:      queueURL,
