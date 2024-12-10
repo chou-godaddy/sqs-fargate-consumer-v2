@@ -68,22 +68,29 @@ if time.Since(lastScaleDownTime) < config.ScaleDownCoolDown {
 - Deletes messages from SQS after successful processing
 
 ### Scaling Factors
-1. Worker Utilization Check:
+1. Buffer Pressure
+```go
+high, medium, low, ok := mp.bufferMetricsCollector.GetBufferUtilization()
+bufferPressure := high > mp.config.ScaleThreshold ||
+				medium > mp.config.ScaleThreshold ||
+				low > mp.config.ScaleThreshold
+```
+2. Worker Utilization Check:
 ```go
 utilizationRate := float64(activeWorkers) / float64(currentWorkers)
 workerPressure := utilizationRate > config.ScaleThreshold
 ```
-2. Backlog Assessment:
+3. Backlog Assessment:
 ```go
 backlogThreshold := config.MaxWorkers * 10
 backlogPressure := backlog > backlogThreshold
 ```
-3. Scale Up Decision:
+4. Scale Up Decision:
 ```go
 shouldScaleUp := (bufferPressure || workerPressure || backlogPressure) &&
                  currentWorkers < config.MaxWorkers
 ```
-4. Scale Down Decision:
+5. Scale Down Decision:
 ```go
 lowUtilization := utilizationRate < config.ScaleThreshold/2
 lowBacklog := backlog < config.MinWorkers*5
