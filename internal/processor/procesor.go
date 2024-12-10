@@ -231,7 +231,7 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			return
 		case <-ticker.C:
 			// Get metrics without holding scaling lock
-			high, medium, low, ok := mp.bufferMetricsCollector.GetBufferUtilization()
+			bufferUsage, ok := mp.bufferMetricsCollector.GetBufferUtilization()
 			if !ok {
 				log.Printf("[Processor] Warning: Buffer utilization metrics not available")
 				continue
@@ -262,17 +262,15 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			}
 
 			// Log metrics
-			log.Printf("[Processor] Scaling metrics - Workers: %d/%d (%.2f%% utilized), Backlog: %d, Buffer Usage: High=%.2f%%, Medium=%.2f%%, Low=%.2f%%",
+			log.Printf("[Processor] Scaling metrics - Workers: %d/%d (%.2f%% utilized), Backlog: %d, Buffer Usage: %.2f%%",
 				currentWorkers, mp.config.MaxWorkers, utilizationRate*100,
-				backlog, high*100, medium*100, low*100)
+				backlog, bufferUsage*100)
 
 			// Evaluate scaling conditions
 			shouldScaleUp := false
 			shouldScaleDown := false
 
-			bufferPressure := high > mp.config.ScaleThreshold ||
-				medium > mp.config.ScaleThreshold ||
-				low > mp.config.ScaleThreshold
+			bufferPressure := bufferUsage > mp.config.ScaleThreshold
 
 			workerPressure := utilizationRate > mp.config.ScaleThreshold
 			backlogThreshold := int64(mp.config.MaxWorkers * 10)
@@ -281,18 +279,15 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			// Determine scaling direction
 			if currentWorkers < int32(mp.config.MaxWorkers) {
 				if bufferPressure {
-					log.Printf("[Processor] Buffer pressure detected (High: %.2f%%, Medium: %.2f%%, Low: %.2f%%)",
-						high*100, medium*100, low*100)
+					log.Printf("[Processor] Buffer pressure detected (BufferUsage: %.2f%%)", bufferUsage*100)
 					shouldScaleUp = true
 				}
 				if workerPressure {
-					log.Printf("[Processor] Worker utilization pressure detected (%.2f%%)",
-						utilizationRate*100)
+					log.Printf("[Processor] Worker utilization pressure detected (%.2f%%)", utilizationRate*100)
 					shouldScaleUp = true
 				}
 				if backlogPressure {
-					log.Printf("[Processor] Message backlog pressure detected (%d messages)",
-						backlog)
+					log.Printf("[Processor] Message backlog pressure detected (%d messages)", backlog)
 					shouldScaleUp = true
 				}
 			}
@@ -378,7 +373,12 @@ func (mp *MessageProcessorImpl) Shutdown(ctx context.Context) error {
 // GetMetrics returns current processor metrics
 func (mp *MessageProcessorImpl) GetMetrics() models.ProcessorMetrics {
 	mp.mu.RLock()
-	activeWorkers := len(mp.workers)
+	activeWorkers := 0
+	for _, worker := range mp.workers {
+		if worker.status.Load() == workerStatusProcessing {
+			activeWorkers++
+		}
+	}
 	mp.mu.RUnlock()
 
 	return models.ProcessorMetrics{

@@ -149,9 +149,7 @@
         ]
     },
     "buffer": {
-        "highPrioritySize": 6000,
-        "mediumPrioritySize": 5000,
-        "lowPrioritySize": 4000,
+        "totalCapacity": 10000,
         "maxMessageSize": 262144,
         "scaleThreshold": 0.7
     },

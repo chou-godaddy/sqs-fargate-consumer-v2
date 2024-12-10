@@ -13,10 +13,9 @@ import (
 
 // MessageBuffer manages priority-based message queues
 type MessageBufferImpl struct {
-	highPriority   chan *models.Message
-	mediumPriority chan *models.Message
-	lowPriority    chan *models.Message
-	maxSize        int64
+	messages chan *models.Message
+	maxSize  int64
+	capacity int
 
 	metricsEmitter interfaces.BufferMetricsEmitter
 
@@ -28,12 +27,11 @@ type MessageBufferImpl struct {
 func NewMessageBuffer(config config.BufferConfig) interfaces.MessageBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MessageBufferImpl{
-		highPriority:   make(chan *models.Message, config.HighPrioritySize),
-		mediumPriority: make(chan *models.Message, config.MediumPrioritySize),
-		lowPriority:    make(chan *models.Message, config.LowPrioritySize),
-		maxSize:        config.MaxMessageSize,
-		ctx:            ctx,
-		cancelFunc:     cancel,
+		messages:   make(chan *models.Message, config.TotalCapacity),
+		maxSize:    config.MaxMessageSize,
+		capacity:   config.TotalCapacity,
+		ctx:        ctx,
+		cancelFunc: cancel,
 	}
 }
 
@@ -42,16 +40,16 @@ func (b *MessageBufferImpl) SetMetricsEmitter(emitter interfaces.BufferMetricsEm
 }
 
 func (b *MessageBufferImpl) Start(ctx context.Context) error {
-	log.Printf("[Buffer] Starting with capacities - High: %d, Medium: %d, Low: %d", cap(b.highPriority), cap(b.mediumPriority), cap(b.lowPriority))
+	log.Printf("[Buffer] Starting with capacity: %d", b.capacity)
 
 	// Start metrics collection routine
 	b.wg.Add(1)
-	go b.monitorQueueSizes()
+	go b.monitorBufferSize()
 
 	return nil
 }
 
-func (b *MessageBufferImpl) monitorQueueSizes() {
+func (b *MessageBufferImpl) monitorBufferSize() {
 	defer b.wg.Done()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -62,109 +60,52 @@ func (b *MessageBufferImpl) monitorQueueSizes() {
 			return
 		case <-ticker.C:
 			if b.metricsEmitter != nil {
-				highUsage := float64(len(b.highPriority)) / float64(cap(b.highPriority))
-				mediumUsage := float64(len(b.mediumPriority)) / float64(cap(b.mediumPriority))
-				lowUsage := float64(len(b.lowPriority)) / float64(cap(b.lowPriority))
+				currentSize := len(b.messages)
+				b.metricsEmitter.OnBufferSizeChanged(currentSize, b.capacity)
 
-				b.metricsEmitter.OnQueueSizeChanged(models.PriorityHigh, len(b.highPriority), cap(b.highPriority))
-				b.metricsEmitter.OnQueueSizeChanged(models.PriorityMedium, len(b.mediumPriority), cap(b.mediumPriority))
-				b.metricsEmitter.OnQueueSizeChanged(models.PriorityLow, len(b.lowPriority), cap(b.lowPriority))
-
-				// Log both buffer occupancy and processing throughput
-				log.Printf("[Buffer] Channel utilization - High: %.2f%%, Medium: %.2f%%, Low: %.2f%%", highUsage*100, mediumUsage*100, lowUsage*100)
+				usage := float64(currentSize) / float64(b.capacity)
+				log.Printf("[Buffer] Channel utilization: %.2f%% (%d/%d)", usage*100, currentSize, b.capacity)
 			}
 		}
 	}
 }
 
-// Push adds a message to the appropriate priority queue
+// Push adds a message to the buffer, blocking if the buffer is full
 func (b *MessageBufferImpl) Push(msg *models.Message) error {
 	if msg == nil {
 		return fmt.Errorf("cannot push nil message")
 	}
 
 	if msg.Size > b.maxSize {
-		return fmt.Errorf("message size %d exceeds maximum %d", msg.Size, b.maxSize)
+		return models.ErrMessageTooLarge
 	}
 
 	msg.EnqueuedAt = time.Now()
 
-	// Try to push to appropriate queue
-	var pushed bool
-	var err error
-
-	switch msg.Priority {
-	case models.PriorityHigh:
-		select {
-		case b.highPriority <- msg:
-			pushed = true
-		default:
-			err = fmt.Errorf("high priority buffer full")
-		}
-
-	case models.PriorityMedium:
-		select {
-		case b.mediumPriority <- msg:
-			pushed = true
-		default:
-			err = fmt.Errorf("medium priority buffer full")
-		}
-
-	case models.PriorityLow:
-		select {
-		case b.lowPriority <- msg:
-			pushed = true
-		default:
-			err = fmt.Errorf("low priority buffer full")
-		}
-	}
-
-	if pushed {
+	// Block until either the message is pushed or context is done
+	select {
+	case <-b.ctx.Done():
+		return models.ErrBufferShuttingDown
+	case b.messages <- msg:
 		if b.metricsEmitter != nil {
 			b.metricsEmitter.OnMessageEnqueued(msg)
 		}
-		log.Printf("[Buffer] Pushed message %s to %s priority queue (Size: %d)", msg.MessageID, getPriorityString(msg.Priority), msg.Size)
-	} else {
-		if b.metricsEmitter != nil {
-			b.metricsEmitter.OnBufferOverflow(msg.Priority)
-		}
-		log.Printf("[Buffer] Failed to push message %s: %v", msg.MessageID, err)
+		log.Printf("[Buffer] Pushed message %s (Size: %d)",
+			msg.MessageID, msg.Size)
+		return nil
 	}
-
-	return err
 }
 
-// Pop retrieves the next message based on priority
+// Pop retrieves the next message from the buffer
 func (b *MessageBufferImpl) Pop(ctx context.Context) (*models.Message, error) {
-	// Try high priority first
 	select {
-	case msg := <-b.highPriority:
-		if b.metricsEmitter != nil {
-			b.metricsEmitter.OnMessageDequeued(msg)
-		}
-		return msg, nil
-	default:
-	}
-
-	// Try medium priority
-	select {
-	case msg := <-b.mediumPriority:
-		if b.metricsEmitter != nil {
-			b.metricsEmitter.OnMessageDequeued(msg)
-		}
-		return msg, nil
-	default:
-	}
-
-	// Try low priority with timeout
-	select {
-	case msg := <-b.lowPriority:
-		if b.metricsEmitter != nil {
-			b.metricsEmitter.OnMessageDequeued(msg)
-		}
-		return msg, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case msg := <-b.messages:
+		if b.metricsEmitter != nil {
+			b.metricsEmitter.OnMessageDequeued(msg)
+		}
+		return msg, nil
 	case <-time.After(100 * time.Millisecond):
 		return nil, nil
 	}
@@ -197,9 +138,7 @@ func (b *MessageBufferImpl) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return fmt.Errorf("buffer shutdown timed out: %w", ctx.Err())
 	case <-done:
-		close(b.highPriority)
-		close(b.mediumPriority)
-		close(b.lowPriority)
+		close(b.messages)
 		log.Printf("[Buffer] Shutdown completed")
 		return nil
 	}

@@ -29,11 +29,9 @@ type ConsumerConfig struct {
 }
 
 type BufferConfig struct {
-	HighPrioritySize   int     `json:"highPrioritySize"`
-	MediumPrioritySize int     `json:"mediumPrioritySize"`
-	LowPrioritySize    int     `json:"lowPrioritySize"`
-	MaxMessageSize     int64   `json:"maxMessageSize"`
-	ScaleThreshold     float64 `json:"scaleThreshold"`
+	TotalCapacity  int     `json:"totalCapacity"`
+	MaxMessageSize int64   `json:"maxMessageSize"`
+	ScaleThreshold float64 `json:"scaleThreshold"`
 }
 
 type ProcessorConfig struct {

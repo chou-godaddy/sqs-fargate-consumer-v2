@@ -1,10 +1,16 @@
 package models
 
 import (
+	"errors"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+)
+
+var (
+	ErrBufferShuttingDown = errors.New("buffer is shutting down")
+	ErrMessageTooLarge    = errors.New("message exceeds maximum size")
 )
 
 type MetricPoint struct {
@@ -41,30 +47,27 @@ type Message struct {
 
 // BufferMetrics represents buffer utilization metrics
 type BufferMetrics struct {
-	// Channel utilization metrics
-	HighPriorityUsage   float64 // Percentage of high priority channel capacity used (0-1)
-	MediumPriorityUsage float64 // Percentage of medium priority channel capacity used (0-1)
-	LowPriorityUsage    float64 // Percentage of low priority channel capacity used (0-1)
+	// Basic buffer metrics
+	BufferUsage    float64 // Percentage of buffer capacity used (0-1)
+	CurrentSize    int64   // Current number of messages in buffer
+	BufferCapacity int64   // Total buffer capacity
+	TotalSize      int64   // Total size of all messages in bytes
 
 	// Message counts
-	TotalSize              int64 // Total size of all messages currently in buffer
-	TotalMessagesIn        int64 // Total messages pushed to buffer
-	TotalMessagesOut       int64 // Total messages popped from buffer
-	HighPriorityMessages   int64 // Count of high priority messages processed
-	MediumPriorityMessages int64 // Count of medium priority messages processed
-	LowPriorityMessages    int64 // Count of low priority messages processed
-	OverflowCount          int32 // Number of times buffer was full when trying to push
+	TotalMessagesIn  int64 // Total messages pushed to buffer
+	TotalMessagesOut int64 // Total messages popped from buffer
 
-	// Wait time metrics
-	AverageWaitTime   time.Duration    // Average time messages spend in buffer
-	MaxWaitTime       time.Duration    // Maximum time any message spent in buffer
-	WaitTimeHistogram map[string]int64 // Distribution of wait times in various buckets
+	// Priority tracking (for monitoring only)
+	HighPriorityMessages   int64
+	MediumPriorityMessages int64
+	LowPriorityMessages    int64
 
-	// Processing metrics
-	MessageProcessingRate float64 // Messages processed per second
-
-	// Point-in-time metrics
-	LastUpdateTime time.Time // When these metrics were last updated
+	// Performance metrics
+	AverageWaitTime       time.Duration    // Average time messages spend in buffer
+	MaxWaitTime           time.Duration    // Maximum time any message spent in buffer
+	WaitTimeHistogram     map[string]int64 // Distribution of wait times
+	MessageProcessingRate float64          // Messages processed per second
+	LastUpdateTime        time.Time        // When these metrics were last updated
 }
 
 // ProcessorMetrics represents metrics specific to message processing

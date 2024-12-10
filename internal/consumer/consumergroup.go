@@ -155,31 +155,6 @@ func (cg *ConsumerGroup) runWorker(consumer *Consumer) {
 	}
 }
 
-func (cg *ConsumerGroup) shouldThrottleForPriority(priority int, consumer *Consumer) (bool, float64) {
-	high, medium, low, ok := cg.bufferMetricsCollector.GetBufferUtilization()
-	if !ok {
-		return true, 0 // Throttle if we can't get metrics
-	}
-
-	var bufferUsage float64
-	switch priority {
-	case 3:
-		bufferUsage = high
-	case 2:
-		bufferUsage = medium
-	case 1:
-		bufferUsage = low
-	}
-
-	if bufferUsage > cg.config.ScaleThreshold {
-		log.Printf("[Consumer %s] Priority %d buffer pressure (%.2f%%), backing off",
-			consumer.id, priority, bufferUsage*100)
-		return true, bufferUsage
-	}
-
-	return false, bufferUsage
-}
-
 func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
 	// Check minimum poll interval
 	lastPollTime := time.Unix(0, consumer.lastPoll.Load())
@@ -204,18 +179,23 @@ func (cg *ConsumerGroup) pollAndProcess(consumer *Consumer) error {
 	}
 	defer consumer.status.Store(consumerStatusIdle)
 
-	// Check if we should throttle for this priority
-	if shouldThrottle, bufferUsage := cg.shouldThrottleForPriority(queue.Priority, consumer); shouldThrottle {
-		time.Sleep(time.Duration(float64(cg.config.PollBackoffInterval.Duration) * bufferUsage))
-		return nil
+	// Poll and process messages
+	if err := cg.pollQueue(consumer, queue); err != nil {
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return nil // Normal shutdown or timeout, don't log as error
+		}
+		return err
 	}
 
-	// Poll and process messages
-	return cg.pollQueue(consumer, queue)
+	return nil
 }
 
 func (cg *ConsumerGroup) pollQueue(consumer *Consumer, queue *config.QueueConfig) error {
-	result, err := cg.sqsClient.ReceiveMessage(cg.ctx, &sqs.ReceiveMessageInput{
+	// Create a timeout context for the entire batch processing
+	batchCtx, cancel := context.WithTimeout(cg.ctx, 30*time.Second)
+	defer cancel()
+
+	result, err := cg.sqsClient.ReceiveMessage(batchCtx, &sqs.ReceiveMessageInput{
 		QueueUrl:            &queue.URL,
 		MaxNumberOfMessages: int32(cg.config.MaxBatchSize),
 		WaitTimeSeconds:     20,
@@ -230,17 +210,33 @@ func (cg *ConsumerGroup) pollQueue(consumer *Consumer, queue *config.QueueConfig
 		return fmt.Errorf("failed to receive messages: %w", err)
 	}
 
+	log.Printf("[Consumer %s] Received %d messages from queue %s (Priority: %d)",
+		consumer.id, len(result.Messages), queue.Name, queue.Priority)
+
 	messageCount := 0
 	for _, msg := range result.Messages {
 		message := models.NewMessage(&msg, queue.URL, queue.Name, models.Priority(queue.Priority))
 
-		if err := cg.buffer.Push(message); err != nil {
-			log.Printf("[Consumer %s] Failed to buffer message %s: %v",
-				consumer.id, message.MessageID, err)
-			continue
-		}
+		// With blocking channels, we'll keep trying until context is done
+		select {
+		case <-batchCtx.Done():
+			log.Printf("[Consumer %s] Context done while pushing message %s: %v",
+				consumer.id, message.MessageID, batchCtx.Err())
+			return batchCtx.Err()
 
-		messageCount++
+		default:
+			// This will block until the message is pushed or context is done
+			err := cg.buffer.Push(message)
+			if err != nil {
+				if err == models.ErrMessageTooLarge {
+					log.Printf("[Consumer %s] Message %s exceeds size limit, skipping",
+						consumer.id, message.MessageID)
+					continue
+				}
+				return fmt.Errorf("failed to push message: %w", err)
+			}
+			messageCount++
+		}
 	}
 
 	if messageCount > 0 {
@@ -279,8 +275,7 @@ func (cg *ConsumerGroup) monitorAndScale() {
 	}
 }
 
-func (cg *ConsumerGroup) shouldScale(highUsage, mediumUsage, lowUsage float64, messagesIn, messagesOut int64) int {
-	maxBufferUsage := max(highUsage, max(mediumUsage, lowUsage))
+func (cg *ConsumerGroup) shouldScale(messagesIn, messagesOut int64) int {
 	currentWorkers := cg.workerCount.Load()
 
 	// Check cooldown periods
@@ -292,26 +287,21 @@ func (cg *ConsumerGroup) shouldScale(highUsage, mediumUsage, lowUsage float64, m
 		return 0
 	}
 
-	// Emergency scale down takes precedence
-	if maxBufferUsage > cg.config.ScaleThreshold {
-		log.Printf("[ConsumerGroup] Emergency scale down - buffer usage %.2f%% above threshold. Current workers: %d",
-			maxBufferUsage*100, currentWorkers)
-		return -1
+	// Calculate message processing rate
+	messageBacklog := messagesIn - messagesOut
+
+	// Scale up if we have a significant backlog
+	if messageBacklog > int64(currentWorkers*5) { // Each worker should handle ~5 messages
+		log.Printf("[ConsumerGroup] Scale up - backlog of %d messages with %d workers",
+			messageBacklog, currentWorkers)
+		return 1
 	}
 
-	// Regular scaling conditions
-	if messagesIn == messagesOut {
-		if maxBufferUsage < cg.config.ScaleThreshold/3 {
-			log.Printf("[ConsumerGroup] Scale down - no backlog and low buffer usage (%.2f%%). Current workers: %d",
-				maxBufferUsage*100, currentWorkers)
-			return -1
-		}
-	} else if messagesIn > messagesOut {
-		if maxBufferUsage < cg.config.ScaleThreshold {
-			log.Printf("[ConsumerGroup] Scale up - has backlog and buffer space (%.2f%%). Current workers: %d",
-				maxBufferUsage*100, currentWorkers)
-			return 1
-		}
+	// Scale down if backlog is very low
+	if messageBacklog < int64(currentWorkers*2) { // Less than 2 messages per worker
+		log.Printf("[ConsumerGroup] Scale down - low backlog of %d messages with %d workers",
+			messageBacklog, currentWorkers)
+		return -1
 	}
 
 	return 0
@@ -321,17 +311,12 @@ func (cg *ConsumerGroup) adjustWorkerCount() {
 	cg.scalingMu.Lock()
 	defer cg.scalingMu.Unlock()
 
-	high, medium, low, ok := cg.bufferMetricsCollector.GetBufferUtilization()
-	if !ok {
-		return
-	}
-
 	messagesIn, messagesOut, ok := cg.bufferMetricsCollector.GetMessageCounts()
 	if !ok {
 		return
 	}
 
-	scale := cg.shouldScale(high, medium, low, messagesIn, messagesOut)
+	scale := cg.shouldScale(messagesIn, messagesOut)
 	currentWorkers := cg.workerCount.Load()
 	now := time.Now()
 
@@ -373,9 +358,6 @@ func (cg *ConsumerGroup) adjustWorkerCount() {
 			cg.config.ScaleDownStep,
 			int(currentWorkers-int32(cg.config.MinWorkers)),
 		)
-
-		log.Printf("[ConsumerGroup] Attempting to remove %d workers from current count %d",
-			workersToRemove, currentWorkers)
 
 		if workersToRemove > 0 {
 			successfullyRemoved := 0

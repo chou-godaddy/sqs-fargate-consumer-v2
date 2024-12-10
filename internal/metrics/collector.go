@@ -206,45 +206,46 @@ func (c *Collector) publishToCloudWatch(ctx context.Context) error {
 	if !ok {
 		log.Printf("[Collector] Warning: Unable to get buffer metrics for CloudWatch")
 	} else {
-
-		// Queue usage metrics
+		// Basic buffer metrics
 		metricData = append(metricData,
-			c.createMetricDatum("BufferHighPriorityUsage", bufferMetrics.HighPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
-			c.createMetricDatum("BufferMediumPriorityUsage", bufferMetrics.MediumPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
-			c.createMetricDatum("BufferLowPriorityUsage", bufferMetrics.LowPriorityUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+			c.createMetricDatum("BufferUsage", bufferMetrics.BufferUsage*100, types.StandardUnitPercent, "Buffer", time.Now()),
+			c.createMetricDatum("BufferSize", float64(bufferMetrics.CurrentSize), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("BufferCapacity", float64(bufferMetrics.BufferCapacity), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("BufferTotalSize", float64(bufferMetrics.TotalSize), types.StandardUnitBytes, "Buffer", time.Now()),
 		)
 
-		// Message counts
+		// Message throughput metrics
 		metricData = append(metricData,
-			c.createMetricDatum("BufferTotalSize", float64(bufferMetrics.TotalSize), types.StandardUnitBytes, "Buffer", time.Now()),
 			c.createMetricDatum("BufferMessagesIn", float64(bufferMetrics.TotalMessagesIn), types.StandardUnitCount, "Buffer", time.Now()),
 			c.createMetricDatum("BufferMessagesOut", float64(bufferMetrics.TotalMessagesOut), types.StandardUnitCount, "Buffer", time.Now()),
-			c.createMetricDatum("BufferOverflows", float64(bufferMetrics.OverflowCount), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("BufferProcessingRate", bufferMetrics.MessageProcessingRate, types.StandardUnitCountSecond, "Buffer", time.Now()),
 		)
 
-		// Wait time metrics
+		// Message priority tracking (for monitoring)
+		metricData = append(metricData,
+			c.createMetricDatum("HighPriorityMessages", float64(bufferMetrics.HighPriorityMessages), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("MediumPriorityMessages", float64(bufferMetrics.MediumPriorityMessages), types.StandardUnitCount, "Buffer", time.Now()),
+			c.createMetricDatum("LowPriorityMessages", float64(bufferMetrics.LowPriorityMessages), types.StandardUnitCount, "Buffer", time.Now()),
+		)
+
+		// Latency metrics
 		metricData = append(metricData,
 			c.createMetricDatum("BufferAverageWaitTime", float64(bufferMetrics.AverageWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
 			c.createMetricDatum("BufferMaxWaitTime", float64(bufferMetrics.MaxWaitTime.Milliseconds()), types.StandardUnitMilliseconds, "Buffer", time.Now()),
 		)
-	}
 
-	// Wait time histogram
-	for bucket, count := range bufferMetrics.WaitTimeHistogram {
-		metricData = append(metricData,
-			c.createMetricDatum("BufferWaitTimeDistribution", float64(count), types.StandardUnitCount, "Buffer", time.Now(),
-				types.Dimension{
-					Name:  aws.String("TimeBucket"),
-					Value: aws.String(bucket),
-				},
-			),
-		)
+		// Wait time distribution
+		for bucket, count := range bufferMetrics.WaitTimeHistogram {
+			metricData = append(metricData,
+				c.createMetricDatum("BufferWaitTimeDistribution", float64(count), types.StandardUnitCount, "Buffer", time.Now(),
+					types.Dimension{
+						Name:  aws.String("TimeBucket"),
+						Value: aws.String(bucket),
+					},
+				),
+			)
+		}
 	}
-
-	// Processing rate
-	metricData = append(metricData,
-		c.createMetricDatum("BufferProcessingRate", bufferMetrics.MessageProcessingRate, types.StandardUnitCountSecond, "Buffer", time.Now()),
-	)
 
 	// Publish metrics in batches of 20 (CloudWatch limit)
 	for i := 0; i < len(metricData); i += 20 {

@@ -48,22 +48,19 @@ type MessageProcessor interface {
 type BufferMetricsEmitter interface {
 	OnMessageEnqueued(message *models.Message)
 	OnMessageDequeued(message *models.Message)
-	OnBufferOverflow(priority models.Priority)
-	OnQueueSizeChanged(priority models.Priority, currentSize, capacity int)
+	OnBufferSizeChanged(currentSize, capacity int)
 }
 
 // BufferMetricsCollector defines methods for collecting and accessing buffer metrics
 type BufferMetricsCollector interface {
 	BufferMetricsEmitter
 
-	// Fast access methods for operational metrics, atomic values retrieval
-	// Returns ok=false if metrics are not available
-	GetBufferUtilization() (high, medium, low float64, ok bool)
+	// Fast access methods for operational metrics
+	GetBufferUtilization() (float64, bool)
 	GetMessageCounts() (in, out int64, ok bool)
 	GetPriorityMessageCounts() (high, medium, low int64, ok bool)
 	GetTotalSize() (size int64, ok bool)
-	GetOverflowCount() (count int32, ok bool)
 
-	// Full metrics for monitoring, mutex-protected
-	GetMetrics() (models.BufferMetrics, bool) // returns ok=false if metrics not available
+	// Full metrics for monitoring
+	GetMetrics() (models.BufferMetrics, bool)
 }
