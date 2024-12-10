@@ -58,6 +58,12 @@
                 "ote": "1",
                 "prod": "1"
               },
+              "fargate_cpu": {
+                "dev": "512"
+              },
+              "fargate_memory": {
+                "dev": "1GB"
+              },
               "fargate_custom_task_role": "sqs-fargate-consumer-v2-FargateTaskRole",
               "skip_tests": true
             }
