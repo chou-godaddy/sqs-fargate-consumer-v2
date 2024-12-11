@@ -6,16 +6,16 @@ toolchain go1.22.9
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.32.5
-	github.com/aws/aws-sdk-go-v2/config v1.28.5
-	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.43.1
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.37.1
+	github.com/aws/aws-sdk-go-v2/config v1.28.3
+	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.42.4
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.37.0
 	github.com/gdcorp-domains/fulfillment-ags3-workflow v1.0.148
 	github.com/gdcorp-domains/fulfillment-generic-queue-client v1.0.4
 	github.com/gdcorp-domains/fulfillment-go-api v1.0.88
 	github.com/gdcorp-domains/fulfillment-go-grule-engine v1.0.19
-	github.com/gdcorp-domains/fulfillment-goapimodels v1.0.109
+	github.com/gdcorp-domains/fulfillment-goapimodels v1.0.107
 	github.com/gdcorp-domains/fulfillment-golang-clients v1.0.129
-	github.com/gdcorp-domains/fulfillment-golang-httpclient v1.0.85
+	github.com/gdcorp-domains/fulfillment-golang-httpclient v1.0.84
 	github.com/gdcorp-domains/fulfillment-golang-logging v1.0.21
 	github.com/gdcorp-domains/fulfillment-golang-sql-interfaces v1.0.11
 	github.com/gdcorp-domains/fulfillment-registrar-config v1.0.57
@@ -23,11 +23,10 @@ require (
 	github.com/gdcorp-domains/fulfillment-registry-contacts v1.0.22
 	github.com/gdcorp-domains/fulfillment-registry-domains v1.0.105
 	github.com/gdcorp-domains/fulfillment-rg-client v1.0.59
-	github.com/gdcorp-domains/fulfillment-rules v1.0.383
+	github.com/gdcorp-domains/fulfillment-rules v1.0.381
 	github.com/gdcorp-domains/fulfillment-sql-data-api-client v1.0.41
 	github.com/gdcorp-domains/fulfillment-worker-helper v1.0.17
 	github.com/gdcorp-uxp/switchboard-client/go/switchboard v1.9.0
-	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f
 )
 
 require (
@@ -125,6 +124,7 @@ require (
 	go.elastic.co/fastjson v1.3.0 // indirect
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/crypto v0.28.0 // indirect
+	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f // indirect
 	golang.org/x/lint v0.0.0-20210508222113-6edffad5e616 // indirect
 	golang.org/x/mod v0.21.0 // indirect
 	golang.org/x/net v0.30.0 // indirect

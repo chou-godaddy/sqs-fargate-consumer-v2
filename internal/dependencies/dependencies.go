@@ -314,3 +314,7 @@ func (dep *Dependencies) GetManagerUserID() *string {
 func (dep *Dependencies) GetRulesetConfigMaps() map[string]workerhelper.RulesetConfig {
 	return dep.RulesetConfigMaps
 }
+
+func (dep *Dependencies) GetSQSClient() *sqs.Client {
+	return dep.SQSClient
+}

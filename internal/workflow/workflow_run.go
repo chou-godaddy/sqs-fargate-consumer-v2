@@ -9,11 +9,11 @@ import (
 	actionmodel "github.com/gdcorp-domains/fulfillment-ags3-workflow/models"
 	actionstatus "github.com/gdcorp-domains/fulfillment-ags3-workflow/models/status"
 
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/gdcorp-domains/fulfillment-go-grule-engine/repository"
 
 	"github.com/gdcorp-domains/fulfillment-rules/ruleset/businesscontext"
 	workflowHelper "github.com/gdcorp-domains/fulfillment-worker-helper"
+	bufferMessageModels "sqs-fargate-consumer-v2/internal/models"
 	workflowModels "sqs-fargate-consumer-v2/internal/workflow/models"
 )
 
@@ -27,10 +27,10 @@ func NewRegistrarDomainsWorker(deps dependencies.WorkflowDependencies) *Registra
 	}
 }
 
-func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message types.Message) error {
-	w.Deps.GetLogger().Infof("Processing message %s for event source %s = %s", message.MessageId, *message.ReceiptHandle, message.Body)
+func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message) error {
+	w.Deps.GetLogger().Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
 	eventMessage := actionmodel.EventMessage{}
-	if err := json.Unmarshal([]byte(*message.Body), &eventMessage); err != nil {
+	if err := json.Unmarshal(message.Body, &eventMessage); err != nil {
 		return err
 	}
 

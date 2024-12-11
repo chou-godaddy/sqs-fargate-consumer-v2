@@ -3,6 +3,7 @@ package dependencies
 import (
 	"sqs-fargate-consumer-v2/internal/config"
 
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	actionapi "github.com/gdcorp-domains/fulfillment-ags3-workflow/client"
 	msmqclient "github.com/gdcorp-domains/fulfillment-generic-queue-client/client"
 	"github.com/gdcorp-domains/fulfillment-go-grule-engine/grule"
@@ -41,4 +42,5 @@ type WorkflowDependencies interface {
 	GetDomainStatusMapping() workerhelper.AGSStatusMapping
 	GetManagerUserID() *string
 	GetRulesetConfigMaps() map[string]workflowHelper.RulesetConfig
+	GetSQSClient() *sqs.Client
 }

@@ -74,7 +74,7 @@ func main() {
 	consumerGroup := consumer.NewConsumerGroup(cfg.Consumer, dep.SQSClient, scheduler, buffer, collector, bufferMetrcisCollector)
 
 	// Create message processor
-	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep.SQSClient, collector, bufferMetrcisCollector)
+	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep, collector, bufferMetrcisCollector)
 
 	// Create root context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
