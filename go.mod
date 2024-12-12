@@ -19,6 +19,7 @@ require (
 	github.com/gdcorp-domains/fulfillment-golang-logging v1.0.21
 	github.com/gdcorp-domains/fulfillment-golang-sql-interfaces v1.0.11
 	github.com/gdcorp-domains/fulfillment-registrar-config v1.0.57
+	github.com/gdcorp-domains/fulfillment-registrar-contact-verification v1.0.62
 	github.com/gdcorp-domains/fulfillment-registrar-domains v1.0.14
 	github.com/gdcorp-domains/fulfillment-registry-contacts v1.0.22
 	github.com/gdcorp-domains/fulfillment-registry-domains v1.0.105
@@ -27,6 +28,7 @@ require (
 	github.com/gdcorp-domains/fulfillment-sql-data-api-client v1.0.41
 	github.com/gdcorp-domains/fulfillment-worker-helper v1.0.17
 	github.com/gdcorp-uxp/switchboard-client/go/switchboard v1.9.0
+	github.com/google/uuid v1.6.0
 )
 
 require (
@@ -76,7 +78,6 @@ require (
 	github.com/gdcorp-domains/fulfillment-gotranslate v1.0.3 // indirect
 	github.com/gdcorp-domains/fulfillment-govalidate v1.0.61 // indirect
 	github.com/gdcorp-domains/fulfillment-openapihandler v1.0.7 // indirect
-	github.com/gdcorp-domains/fulfillment-registrar-contact-verification v1.0.62 // indirect
 	github.com/gdcorp-domains/fulfillment-registrar-contacts v1.0.2 // indirect
 	github.com/gdcorp-domains/fulfillment-registry-hosts v1.0.23 // indirect
 	github.com/gdcorp-domains/fulfillment-structiterator v1.0.11 // indirect
@@ -91,7 +92,6 @@ require (
 	github.com/golang-sql/civil v0.0.0-20190719163853-cb61b32ac6fe // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/harlow/kinesis-consumer v0.3.5 // indirect
 	github.com/jcchavezs/porto v0.6.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect

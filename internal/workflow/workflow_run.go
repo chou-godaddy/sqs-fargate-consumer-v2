@@ -13,9 +13,18 @@ import (
 
 	"github.com/gdcorp-domains/fulfillment-rules/ruleset/businesscontext"
 	workflowHelper "github.com/gdcorp-domains/fulfillment-worker-helper"
+	"github.com/google/uuid"
 	bufferMessageModels "sqs-fargate-consumer-v2/internal/models"
 	workflowModels "sqs-fargate-consumer-v2/internal/workflow/models"
 )
+
+type EventWrapper struct {
+	Detail struct {
+		CustomerID uuid.UUID `json:"customerId"`
+		ActionID   uuid.UUID `json:"actionId"`
+		RequestID  string    `json:"requestId"`
+	} `json:"detail"`
+}
 
 type RegistrarDomainsWorker struct {
 	Deps dependencies.WorkflowDependencies
@@ -29,9 +38,16 @@ func NewRegistrarDomainsWorker(deps dependencies.WorkflowDependencies) *Registra
 
 func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message) error {
 	w.Deps.GetLogger().Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
-	eventMessage := actionmodel.EventMessage{}
-	if err := json.Unmarshal(message.Body, &eventMessage); err != nil {
+
+	var wrapper EventWrapper
+	if err := json.Unmarshal([]byte(message.Body), &wrapper); err != nil {
 		return err
+	}
+
+	eventMessage := actionmodel.EventMessage{
+		CustomerID: wrapper.Detail.CustomerID,
+		ActionID:   wrapper.Detail.ActionID,
+		RequestID:  wrapper.Detail.RequestID,
 	}
 
 	action, code, err := w.Deps.GetActionAPIClient().GetAction(ctx, eventMessage.ActionID, eventMessage.CustomerID, "input", "customerId")

@@ -102,6 +102,7 @@
     "registryContactsUrl": "https://registry-contacts-api.fulfillment.domains.{{.Env}}.aws.gdcld.net",
     "registryDomainsUrl": "https://registry-domains.fulfillment.domains.{{.Env}}.aws.gdcld.net",
     "actionApiUrl": {{if eq .Env "dev-private"}}"https://actions.fulfillment.domains.dp.aws.gdcld.net"{{ else }}"https://actions.fulfillment.domains.{{.Env}}.aws.gdcld.net"{{end}},
+    "contactVerificationApiUrl" : "https://contact-verification.fulfillment.domains.{{.Env}}.aws.gdcld.net",
     "switchBoardApplicationName": "default|fulfillment-rules",
     "database": "DOMAINS",
     "sqldataApiUrl": {{if eq .Env "dev-private"}}"https://api-writer.domsql.dp.aws.gdcld.net"{{ else }}"https://api-writer.domsql.{{.Env}}.aws.gdcld.net"{{ end }},
@@ -111,15 +112,15 @@
     "genericQueueEndpointUrl": {{if eq .Env "dev"}}"https://agentservices.phx3.int.dev-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "test"}}"https://agentservices.phx3.int.test-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{ else if eq .Env "prod" }}"https://agentservices.api.phx3.int.godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "ote"}}"https://agentservices.api.phx3.int.ote-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{end}},
     "consumer": {
         "maxWorkers": 100,
-        "minWorkers": 2,
+        "minWorkers": 10,
         "maxBatchSize": 10,
         "minpollInterval": "100ms",
         "pollBackoffInterval": "2s",
-        "scaleInterval": "5s",
-        "scaleThreshold": 0.8,
-        "scaleUpCoolDown": "5s",
-        "scaleDownCoolDown": "10s",
-        "scaleUpStep": 3,
+        "scaleInterval": "1s",
+        "scaleThreshold": 0.7,
+        "scaleUpCoolDown": "2s",
+        "scaleDownCoolDown": "1m",
+        "scaleUpStep": 5,
         "scaleDownStep": 1,
         "queues": [
             {
@@ -154,10 +155,14 @@
         "scaleThreshold": 0.7
     },
     "processor": {
-        "maxWorkers": 150,
-        "minWorkers": 10,
+        "maxWorkers": 200,
+        "minWorkers": 20,
         "processTimeout": "30s",
         "scaleInterval": "1s",
-        "scaleThreshold": 0.7
+        "scaleThreshold": 0.7,
+        "scaleUpCoolDown": "2s",
+        "scaleDownCoolDown": "1m",
+        "scaleUpStep": 5,
+        "scaleDownStep": 1
     }
   }

@@ -13,6 +13,7 @@ import (
 	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
 	sqlinterfaces "github.com/gdcorp-domains/fulfillment-golang-sql-interfaces"
 	registrarconfig "github.com/gdcorp-domains/fulfillment-registrar-config"
+	contactverification "github.com/gdcorp-domains/fulfillment-registrar-contact-verification"
 	registrycontacts "github.com/gdcorp-domains/fulfillment-registry-contacts"
 	registrydomains "github.com/gdcorp-domains/fulfillment-registry-domains"
 	rgclient "github.com/gdcorp-domains/fulfillment-rg-client"
@@ -43,4 +44,5 @@ type WorkflowDependencies interface {
 	GetManagerUserID() *string
 	GetRulesetConfigMaps() map[string]workflowHelper.RulesetConfig
 	GetSQSClient() *sqs.Client
+	GetContactVerificationAPIClient() contactverification.Client
 }

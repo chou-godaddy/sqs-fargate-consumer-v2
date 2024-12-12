@@ -35,7 +35,9 @@ type MessageProcessorImpl struct {
 	cancelFunc context.CancelFunc
 	wg         sync.WaitGroup
 
-	scalingMu sync.Mutex // Mutex for scaling operations
+	scalingMu         sync.Mutex // Mutex for scaling operations
+	lastScaleUpTime   atomic.Int64
+	lastScaleDownTime atomic.Int64
 }
 
 type Worker struct {
@@ -223,13 +225,11 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			// Get metrics without holding scaling lock
 			bufferUsage, ok := mp.bufferMetricsCollector.GetBufferUtilization()
 			if !ok {
-				log.Printf("[Processor] Warning: Buffer utilization metrics not available")
 				continue
 			}
 
 			messagesIn, messagesOut, ok := mp.bufferMetricsCollector.GetMessageCounts()
 			if !ok {
-				log.Printf("[Processor] Warning: Message count metrics not available")
 				messagesIn, messagesOut = 0, 0
 			}
 
@@ -256,65 +256,68 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 				currentWorkers, mp.config.MaxWorkers, utilizationRate*100,
 				backlog, bufferUsage*100)
 
+			// Check cool down periods
+			now := time.Now()
+			lastScaleUp := time.Unix(0, mp.lastScaleUpTime.Load())
+			lastScaleDown := time.Unix(0, mp.lastScaleDownTime.Load())
+
+			if lastScaleUp.Add(mp.config.ScaleUpCoolDown.Duration).After(now) ||
+				lastScaleDown.Add(mp.config.ScaleDownCoolDown.Duration).After(now) {
+				continue
+			}
+
 			// Evaluate scaling conditions
-			shouldScaleUp := false
-			shouldScaleDown := false
-
 			bufferPressure := bufferUsage > mp.config.ScaleThreshold
-
 			workerPressure := utilizationRate > mp.config.ScaleThreshold
 			backlogThreshold := int64(mp.config.MaxWorkers * 10)
 			backlogPressure := backlog > backlogThreshold
 
-			// Determine scaling direction
-			if currentWorkers < int32(mp.config.MaxWorkers) {
-				if bufferPressure {
-					log.Printf("[Processor] Buffer pressure detected (BufferUsage: %.2f%%)", bufferUsage*100)
-					shouldScaleUp = true
-				}
-				if workerPressure {
-					log.Printf("[Processor] Worker utilization pressure detected (%.2f%%)", utilizationRate*100)
-					shouldScaleUp = true
-				}
-				if backlogPressure {
-					log.Printf("[Processor] Message backlog pressure detected (%d messages)", backlog)
-					shouldScaleUp = true
-				}
-			}
+			mp.scalingMu.Lock()
 
-			if currentWorkers > int32(mp.config.MinWorkers) {
+			if currentWorkers < int32(mp.config.MaxWorkers) &&
+				(bufferPressure || workerPressure || backlogPressure) {
+				// Scale up by configured step size
+				workersToAdd := min(
+					mp.config.ScaleUpStep,
+					int(int32(mp.config.MaxWorkers)-currentWorkers),
+				)
+
+				if workersToAdd > 0 {
+					log.Printf("[Processor] Scaling up by %d workers (current: %d)",
+						workersToAdd, currentWorkers)
+
+					for i := 0; i < workersToAdd; i++ {
+						if err := mp.startWorker(); err != nil {
+							log.Printf("[Processor] Failed to scale up: %v", err)
+							break
+						}
+					}
+					mp.lastScaleUpTime.Store(now.UnixNano())
+				}
+			} else if currentWorkers > int32(mp.config.MinWorkers) {
 				lowUtilization := utilizationRate < mp.config.ScaleThreshold/2
 				lowBacklog := backlog < int64(mp.config.MinWorkers*5)
 
 				if lowUtilization && !bufferPressure && lowBacklog {
-					log.Printf("[Processor] Low pressure detected - Utilization: %.2f%%, Backlog: %d",
-						utilizationRate*100, backlog)
-					shouldScaleDown = true
-				}
-			}
+					// Scale down by configured step size
+					workersToRemove := min(
+						mp.config.ScaleDownStep,
+						int(currentWorkers-int32(mp.config.MinWorkers)),
+					)
 
-			// Only acquire scaling lock when actually scaling
-			if shouldScaleUp || shouldScaleDown {
-				mp.scalingMu.Lock()
-				// Recheck conditions after acquiring lock
-				currentWorkers = mp.workerCount.Load()
+					if workersToRemove > 0 {
+						log.Printf("[Processor] Scaling down by %d workers (current: %d)",
+							workersToRemove, currentWorkers)
 
-				if shouldScaleUp && currentWorkers < int32(mp.config.MaxWorkers) {
-					log.Printf("[Processor] Scaling up worker count: %d -> %d",
-						currentWorkers, currentWorkers+2)
-					// Scale up by 2 workers
-					for i := 0; i < 2; i++ {
-						if err := mp.startWorker(); err != nil {
-							log.Printf("[Processor] Failed to scale up: %v", err)
+						for i := 0; i < workersToRemove; i++ {
+							mp.stopWorker()
 						}
+						mp.lastScaleDownTime.Store(now.UnixNano())
 					}
-				} else if shouldScaleDown && currentWorkers > int32(mp.config.MinWorkers) {
-					log.Printf("[Processor] Scaling down worker count: %d -> %d",
-						currentWorkers, currentWorkers-1)
-					mp.stopWorker()
 				}
-				mp.scalingMu.Unlock()
 			}
+
+			mp.scalingMu.Unlock()
 		}
 	}
 }

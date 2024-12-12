@@ -5,4 +5,24 @@ parameters:
   QueueName: "sqs-fargate-consumer-v2-medium"
   VisibilityTimeout: "300"
   MaxReceiveCount: "10"
+  CustomPolicyJSON: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "EventBridgeToSqsMediumPriority",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Action": "sqs:SendMessage",
+          "Resource": "arn:aws:sqs:us-west-2:982600293865:sqs-fargate-consumer-v2-medium",
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:us-west-2:982600293865:rule/gd-rg0-dev-rfd-events/domains-medium-priority-events"
+            }
+          }
+        }
+      ]
+    }
   # DeadLetterTargetArn: !stack_output_external sqs-fargate-consumer-v2-medium-priority-dlq::QueueArn

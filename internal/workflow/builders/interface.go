@@ -26,8 +26,14 @@ func (retriever *builderRetriever) Retrieve(actionType string) (workerHelper.Bui
 	switch actionType {
 	case workflowModels.LockDomainActionType:
 		return newLockDomainActionCreator(), nil
+	case workflowModels.LockDomainCNActionType:
+		return newLockDomainCNActionCreator(), nil
 	case workflowModels.UnlockDomainActionType:
 		return newUnlockDomainActionCreator(), nil
+	case workflowModels.UnlockDomainCNActionType:
+		return newUnlockDomainCNActionCreator(), nil
+	case workflowModels.UnlockDomainSGActionType:
+		return newUnlockDomainSGActionCreator(), nil
 	}
 	return nil, fmt.Errorf("action type %s has not been implemented", actionType)
 }

@@ -35,11 +35,15 @@ type BufferConfig struct {
 }
 
 type ProcessorConfig struct {
-	MaxWorkers     int      `json:"maxWorkers"`
-	MinWorkers     int      `json:"minWorkers"`
-	ProcessTimeout Duration `json:"processTimeout"`
-	ScaleInterval  Duration `json:"scaleInterval"`
-	ScaleThreshold float64  `json:"scaleThreshold"`
+	MaxWorkers        int      `json:"maxWorkers"`
+	MinWorkers        int      `json:"minWorkers"`
+	ProcessTimeout    Duration `json:"processTimeout"`
+	ScaleInterval     Duration `json:"scaleInterval"`
+	ScaleThreshold    float64  `json:"scaleThreshold"`
+	ScaleUpCoolDown   Duration `json:"scaleUpCoolDown"`
+	ScaleDownCoolDown Duration `json:"scaleDownCoolDown"`
+	ScaleUpStep       int      `json:"scaleUpStep"`
+	ScaleDownStep     int      `json:"scaleDownStep"`
 }
 
 type QueueConfig struct {
@@ -54,6 +58,7 @@ type Config struct {
 	ActionAPIURL               string                 `json:"actionApiUrl"`
 	RegistryContactsURL        string                 `json:"registryContactsUrl"`
 	RegistryDomainsURL         string                 `json:"registryDomainsUrl"`
+	ContactVerificationAPIURL  string                 `json:"contactVerificationApiUrl"`
 	RegistrarConfig            registrarconfig.Config `json:"registrarConfig"`
 	SwitchBoardApplicationName string                 `json:"switchBoardApplicationName"`
 	SQLDATAAPIURL              string                 `json:"sqldataAPIURL"`

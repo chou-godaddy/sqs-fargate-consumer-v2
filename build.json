@@ -59,10 +59,10 @@
                 "prod": "1"
               },
               "fargate_cpu": {
-                "dev": "512"
+                "dev": "1024"
               },
               "fargate_memory": {
-                "dev": "1GB"
+                "dev": "2GB"
               },
               "fargate_custom_task_role": "sqs-fargate-consumer-v2-FargateTaskRole",
               "skip_tests": true

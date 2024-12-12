@@ -275,32 +275,50 @@ func (cg *ConsumerGroup) monitorAndScale() {
 	}
 }
 
-func (cg *ConsumerGroup) shouldScale(messagesIn, messagesOut int64) int {
+func (cg *ConsumerGroup) shouldScale() int {
 	currentWorkers := cg.workerCount.Load()
 
-	// Check cooldown periods
-	now := time.Now()
-	if time.Unix(0, cg.lastScaleUpTime.Load()).Add(cg.config.ScaleUpCoolDown.Duration).After(now) {
-		return 0
+	// Get queue metrics
+	queueMetrics := cg.collector.GetAllQueueMetrics()
+	totalQueuedMessages := 0
+	for _, metrics := range queueMetrics {
+		totalQueuedMessages += int(metrics.MessageCount)
 	}
-	if time.Unix(0, cg.lastScaleDownTime.Load()).Add(cg.config.ScaleDownCoolDown.Duration).After(now) {
+
+	// Check buffer capacity
+	bufferUsage, ok := cg.bufferMetricsCollector.GetBufferUtilization()
+	if !ok {
 		return 0
 	}
 
-	// Calculate message processing rate
-	messageBacklog := messagesIn - messagesOut
+	// Calculate optimal messages per worker based on scale interval
+	// Long polling is 20s, batch size is maxBatchSize
+	scaleIntervalSecs := cg.config.ScaleInterval.Duration.Seconds()
+	pollsPerInterval := scaleIntervalSecs / 20.0 // 20s is long polling interval
+	optimalMsgsPerWorker := pollsPerInterval * float64(cg.config.MaxBatchSize)
 
-	// Scale up if we have a significant backlog
-	if messageBacklog > int64(currentWorkers*5) { // Each worker should handle ~5 messages
-		log.Printf("[ConsumerGroup] Scale up - backlog of %d messages with %d workers",
-			messageBacklog, currentWorkers)
+	// Target 70% of the theoretical maximum
+	targetMsgsPerWorker := optimalMsgsPerWorker * cg.config.ScaleThreshold
+
+	// Calculate current messages per worker
+	messagesPerWorker := float64(totalQueuedMessages) / float64(currentWorkers)
+
+	log.Printf("[ConsumerGroup] Scaling metrics - Workers: %d, Messages: %d, Msgs/Worker: %.2f, "+
+		"Target Msgs/Worker: %.2f, Buffer Usage: %.2f, Scale Interval: %.2fs",
+		currentWorkers, totalQueuedMessages, messagesPerWorker, targetMsgsPerWorker,
+		bufferUsage, scaleIntervalSecs)
+
+	// Scale up if above target and buffer has room
+	if messagesPerWorker > targetMsgsPerWorker && bufferUsage < cg.config.ScaleThreshold {
+		log.Printf("[ConsumerGroup] Scale up suggested - msgs/worker: %.2f exceeds target: %.2f",
+			messagesPerWorker, targetMsgsPerWorker)
 		return 1
 	}
 
-	// Scale down if backlog is very low
-	if messageBacklog < int64(currentWorkers*2) { // Less than 2 messages per worker
-		log.Printf("[ConsumerGroup] Scale down - low backlog of %d messages with %d workers",
-			messageBacklog, currentWorkers)
+	// Scale down if below 50% of target
+	if messagesPerWorker < (targetMsgsPerWorker * 0.5) {
+		log.Printf("[ConsumerGroup] Scale down suggested - msgs/worker: %.2f below 50%% of target: %.2f",
+			messagesPerWorker, targetMsgsPerWorker)
 		return -1
 	}
 
@@ -311,12 +329,7 @@ func (cg *ConsumerGroup) adjustWorkerCount() {
 	cg.scalingMu.Lock()
 	defer cg.scalingMu.Unlock()
 
-	messagesIn, messagesOut, ok := cg.bufferMetricsCollector.GetMessageCounts()
-	if !ok {
-		return
-	}
-
-	scale := cg.shouldScale(messagesIn, messagesOut)
+	scale := cg.shouldScale()
 	currentWorkers := cg.workerCount.Load()
 	now := time.Now()
 

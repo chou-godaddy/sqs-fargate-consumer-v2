@@ -26,6 +26,7 @@ import (
 	sqlinterfaces "github.com/gdcorp-domains/fulfillment-golang-sql-interfaces"
 	registrarconfig "github.com/gdcorp-domains/fulfillment-registrar-config"
 
+	contactverification "github.com/gdcorp-domains/fulfillment-registrar-contact-verification"
 	registrydomains "github.com/gdcorp-domains/fulfillment-registry-domains"
 	rgclient "github.com/gdcorp-domains/fulfillment-rg-client"
 	"github.com/gdcorp-domains/fulfillment-rules/ruleset/godaddy"
@@ -37,25 +38,26 @@ import (
 // Dependencies encapsulates all dependencies to be carried through request processing.
 type Dependencies struct {
 	*goapi.StaticDependencies
-	Config                  *config.Config
-	RegistryContactsClient  registrycontacts.Client
-	RegistryDomainsClient   registrydomains.Client
-	RegistrarConfigCache    registrarconfig.Cache
-	ActionAPIClient         actionapi.Client
-	KnowledgeLibrary        grule.KnowledgeLibraryManager
-	SwitchboardAccessor     switchboard.Accessor
-	SBConfigGetter          workerhelper.SBConfigGetter
-	DBConnection            sqlinterfaces.DatabaseConnection
-	ShopperAPIClient        shopperapi.Client
-	IntlContactsAPIClient   intlcontacts.Client
-	DomainStatusMapping     workerhelper.AGSStatusMapping
-	DomainBoxRulesetMapping workerhelper.DomainBoxMapping
-	RegistryConfigCache     rgclient.Cache
-	MSMQClient              msmqclient.MSMQClient
-	ManagerUserID           *string
-	RulesetConfigMaps       map[string]workerhelper.RulesetConfig
-	SQSClient               *sqs.Client
-	CloudwatchClient        *cloudwatch.Client
+	Config                       *config.Config
+	RegistryContactsClient       registrycontacts.Client
+	RegistryDomainsClient        registrydomains.Client
+	RegistrarConfigCache         registrarconfig.Cache
+	ActionAPIClient              actionapi.Client
+	KnowledgeLibrary             grule.KnowledgeLibraryManager
+	SwitchboardAccessor          switchboard.Accessor
+	SBConfigGetter               workerhelper.SBConfigGetter
+	DBConnection                 sqlinterfaces.DatabaseConnection
+	ShopperAPIClient             shopperapi.Client
+	IntlContactsAPIClient        intlcontacts.Client
+	DomainStatusMapping          workerhelper.AGSStatusMapping
+	DomainBoxRulesetMapping      workerhelper.DomainBoxMapping
+	RegistryConfigCache          rgclient.Cache
+	MSMQClient                   msmqclient.MSMQClient
+	ManagerUserID                *string
+	RulesetConfigMaps            map[string]workerhelper.RulesetConfig
+	SQSClient                    *sqs.Client
+	CloudwatchClient             *cloudwatch.Client
+	ContactVerificationAPIClient contactverification.Client
 }
 
 // Initialize takes the static dependencies and does any one-time setup
@@ -71,6 +73,9 @@ func (dep *Dependencies) Initialize(static *goapi.StaticDependencies) {
 
 	actionAPIURL, _ := url.Parse(dep.Config.ActionAPIURL)
 	dep.ActionAPIClient = actionapi.NewClient(actionAPIURL, iamSSOClient)
+
+	contactVerificationAPIURL, _ := url.Parse(dep.Config.ContactVerificationAPIURL)
+	dep.ContactVerificationAPIClient = contactverification.NewClient(contactVerificationAPIURL, static.HTTPClients.WithCertSSO)
 
 	dep.KnowledgeLibrary = grule.NewKnowledgeLibrary()
 	for _, r := range godaddy.RuleSet() {
@@ -238,6 +243,11 @@ func (dep Dependencies) GetRegistryDomainsClient() registrydomains.Client {
 // GetActionAPIClient returns the action api client
 func (dep Dependencies) GetActionAPIClient() actionapi.Client {
 	return dep.ActionAPIClient
+}
+
+// GetContactVerificationAPIClient returns the contact verification API client
+func (dep Dependencies) GetContactVerificationAPIClient() contactverification.Client {
+	return dep.ContactVerificationAPIClient
 }
 
 // GetKnowledgeBase returns the knowledge base for rules
