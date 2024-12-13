@@ -86,10 +86,17 @@ func (cr *unlockDomainCNActionCreator) BuildDataContext(rulesetName string, work
 	}
 
 	metaStore := state.NewMetaStore()
+	logger = logger.WithFields(map[string]interface{}{
+		"metastoreAddr": fmt.Sprintf("%p", metaStore),
+		"RfdEventID":    domainEvent.AgentMessage.AgentEvent.ID,
+	})
+	logger.Debugf("Created new metastore %p in BuildDataContext", metaStore)
 
 	dataAccessor := NewDataAccessor(deps, metaStore, domainEvent.AgentMessage.Registrar, domainEvent.CustomerID, logger).GetDataAccessor(domainEvent.RegistrarBackend)
 
+	logger.Debugf("Passed metastore %p to DataAccessor", metaStore)
 	dataCtx.Add(rule.MetaStoreKey, metaStore)
+	logger.Debugf("Added metastore %p to dataCtx", metaStore)
 	dataCtx.Add(rule.RegistryContactsClientKey, deps.GetRegistryContactsClient())
 	dataCtx.Add(rule.RegistryDomainsClientKey, deps.GetRegistryDomainsClient())
 	dataCtx.Add(rule.AgentMessageKey, domainEvent.AgentMessage)

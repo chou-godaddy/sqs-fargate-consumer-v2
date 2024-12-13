@@ -13,7 +13,7 @@ require (
 	github.com/gdcorp-domains/fulfillment-generic-queue-client v1.0.4
 	github.com/gdcorp-domains/fulfillment-go-api v1.0.88
 	github.com/gdcorp-domains/fulfillment-go-grule-engine v1.0.19
-	github.com/gdcorp-domains/fulfillment-goapimodels v1.0.107
+	github.com/gdcorp-domains/fulfillment-goapimodels v1.0.110
 	github.com/gdcorp-domains/fulfillment-golang-clients v1.0.129
 	github.com/gdcorp-domains/fulfillment-golang-httpclient v1.0.84
 	github.com/gdcorp-domains/fulfillment-golang-logging v1.0.21
@@ -21,7 +21,7 @@ require (
 	github.com/gdcorp-domains/fulfillment-registrar-config v1.0.57
 	github.com/gdcorp-domains/fulfillment-registrar-contact-verification v1.0.62
 	github.com/gdcorp-domains/fulfillment-registrar-domains v1.0.14
-	github.com/gdcorp-domains/fulfillment-registry-contacts v1.0.22
+	github.com/gdcorp-domains/fulfillment-registry-contacts v1.0.23
 	github.com/gdcorp-domains/fulfillment-registry-domains v1.0.105
 	github.com/gdcorp-domains/fulfillment-rg-client v1.0.59
 	github.com/gdcorp-domains/fulfillment-rules v1.0.381
@@ -138,3 +138,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	howett.net/plist v1.0.1 // indirect
 )
+
+replace github.com/gdcorp-domains/fulfillment-go-grule-engine v1.0.19 => /Users/chou/Desktop/godaddy/gdcorp-domains/fulfillment-go-grule-engine
+
+replace github.com/gdcorp-domains/fulfillment-rules v1.0.381 => /Users/chou/Desktop/godaddy/gdcorp-domains/fulfillment-rules

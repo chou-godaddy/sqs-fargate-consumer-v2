@@ -30,6 +30,7 @@
           "dockerPlatform": "linux/amd64",
           "cgoEnabled": "1",
           "entryPoint": "internal/cmd/sqs-fargate-consumer-v2/main.go",
+          "additionalPackages": ["tzdata"],
           "files": {
             "build/docker/sqs-fargate-consumer-v2": "/go/bin/sqs-fargate-consumer-v2",
             "internal/config/config.json": "/go/bin/internal/config/config.json"

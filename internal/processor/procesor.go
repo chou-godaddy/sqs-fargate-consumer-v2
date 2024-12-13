@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
 )
 
 type MessageProcessorImpl struct {
+	instanceID             string
 	config                 config.ProcessorConfig
 	buffer                 interfaces.MessageBuffer
 	sqsClient              *sqs.Client
@@ -49,6 +51,7 @@ type Worker struct {
 	lastActive    time.Time
 	mu            sync.RWMutex
 	domainsWorker *workflow.RegistrarDomainsWorker
+	logger        logging.Logger
 }
 
 const (
@@ -64,8 +67,11 @@ func NewMessageProcessor(
 	collector interfaces.MetricsCollector,
 	bufferMetricsCollector interfaces.BufferMetricsCollector,
 ) interfaces.MessageProcessor {
+	instanceID := fmt.Sprintf("processor-group-%d", time.Now().UnixNano())
+	log.Printf("[ProcessorGroup] Creating new instance: %s", instanceID)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MessageProcessorImpl{
+		instanceID:             instanceID,
 		config:                 config,
 		buffer:                 buffer,
 		sqsClient:              deps.GetSQSClient(),
@@ -79,7 +85,7 @@ func NewMessageProcessor(
 }
 
 func (mp *MessageProcessorImpl) Start(ctx context.Context) error {
-	log.Printf("[Processor] Starting with initial workers: %d", mp.config.MinWorkers)
+	log.Printf("[Processor %s] Starting with initial workers: %d", mp.instanceID, mp.config.MinWorkers)
 
 	// Start initial workers
 	for i := 0; i < mp.config.MinWorkers; i++ {
@@ -102,12 +108,16 @@ func (mp *MessageProcessorImpl) startWorker() error {
 		return fmt.Errorf("maximum worker count reached")
 	}
 
-	workerID := fmt.Sprintf("processor-%d", time.Now().UnixNano())
+	workerID := fmt.Sprintf("processor-worker-%d", time.Now().UnixNano())
 	worker := &Worker{
 		id:            workerID,
 		stopChan:      make(chan struct{}),
 		processor:     mp,
 		domainsWorker: workflow.NewRegistrarDomainsWorker(mp.deps),
+		logger: mp.deps.GetLogger().WithFields(map[string]interface{}{
+			"processorGroupID":  mp.instanceID,
+			"processorWorkerID": workerID,
+		}),
 	}
 
 	mp.workers[workerID] = worker
@@ -116,7 +126,7 @@ func (mp *MessageProcessorImpl) startWorker() error {
 	mp.wg.Add(1)
 	go mp.runWorker(worker)
 
-	log.Printf("[Processor] Started new worker %s. Total workers: %d", workerID, mp.workerCount.Load())
+	log.Printf("[ProcessorGroup %s] Started new worker %s. Total workers: %d", mp.instanceID, workerID, mp.workerCount.Load())
 	return nil
 }
 
@@ -169,9 +179,13 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	defer cancel()
 
 	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s.", w.id, msg.MessageID, msg.Priority, msg.QueueName)
+	enhancedLogger := w.logger.WithFields(map[string]interface{}{
+		"messageID": msg.MessageID,
+		"queueName": msg.QueueName,
+	})
 
 	// Process the message using the domains worker
-	if err := w.domainsWorker.HandleWorkflowEvent(processCtx, msg); err != nil {
+	if err := w.domainsWorker.HandleWorkflowEvent(processCtx, msg, enhancedLogger); err != nil {
 		w.processor.collector.RecordError(msg.QueueName)
 		w.processor.errorCount.Add(1)
 		return fmt.Errorf("worker %s failed to process message: %w", w.id, err)
@@ -252,8 +266,8 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 			}
 
 			// Log metrics
-			log.Printf("[Processor] Scaling metrics - Workers: %d/%d (%.2f%% utilized), Backlog: %d, Buffer Usage: %.2f%%",
-				currentWorkers, mp.config.MaxWorkers, utilizationRate*100,
+			log.Printf("[ProcessorGroup %s] Scaling metrics - Workers: %d/%d (%.2f%% utilized), Backlog: %d, Buffer Usage: %.2f%%",
+				mp.instanceID, currentWorkers, mp.config.MaxWorkers, utilizationRate*100,
 				backlog, bufferUsage*100)
 
 			// Check cool down periods
@@ -283,12 +297,12 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 				)
 
 				if workersToAdd > 0 {
-					log.Printf("[Processor] Scaling up by %d workers (current: %d)",
-						workersToAdd, currentWorkers)
+					log.Printf("[ProcessorGroup %s] Scaling up by %d workers (current: %d)",
+						mp.instanceID, workersToAdd, currentWorkers)
 
 					for i := 0; i < workersToAdd; i++ {
 						if err := mp.startWorker(); err != nil {
-							log.Printf("[Processor] Failed to scale up: %v", err)
+							log.Printf("[ProcessorGroup %s] Failed to scale up: %v", mp.instanceID, err)
 							break
 						}
 					}
@@ -306,8 +320,8 @@ func (mp *MessageProcessorImpl) monitorAndScale() {
 					)
 
 					if workersToRemove > 0 {
-						log.Printf("[Processor] Scaling down by %d workers (current: %d)",
-							workersToRemove, currentWorkers)
+						log.Printf("[ProcessorGroup %s] Scaling down by %d workers (current: %d)",
+							mp.instanceID, workersToRemove, currentWorkers)
 
 						for i := 0; i < workersToRemove; i++ {
 							mp.stopWorker()
@@ -330,14 +344,14 @@ func (mp *MessageProcessorImpl) stopWorker() {
 	for _, worker := range mp.workers {
 		if worker.status.Load() == workerStatusIdle {
 			close(worker.stopChan)
-			log.Printf("[Processor] Stopped worker %s", worker.id)
+			log.Printf("[ProcessorGroup %s] Stopped worker %s", mp.instanceID, worker.id)
 			return
 		}
 	}
 }
 
 func (mp *MessageProcessorImpl) Shutdown(ctx context.Context) error {
-	log.Printf("[Processor] Initiating shutdown...")
+	log.Printf("[ProcessorGroup %s] Initiating shutdown...", mp.instanceID)
 	mp.cancelFunc()
 
 	// Stop all workers
@@ -358,7 +372,7 @@ func (mp *MessageProcessorImpl) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-done:
-		log.Printf("[Processor] Shutdown completed. Processed %d messages, %d errors", mp.processedCount.Load(), mp.errorCount.Load())
+		log.Printf("[ProcessorGroup %s] Shutdown completed. Processed %d messages, %d errors", mp.instanceID, mp.processedCount.Load(), mp.errorCount.Load())
 		return nil
 	}
 }
