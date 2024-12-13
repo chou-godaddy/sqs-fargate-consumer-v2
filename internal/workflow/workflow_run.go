@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sqs-fargate-consumer-v2/internal/dependencies"
 	"sqs-fargate-consumer-v2/internal/workflow/builders"
 
@@ -15,6 +16,7 @@ import (
 	bufferMessageModels "sqs-fargate-consumer-v2/internal/models"
 	workflowModels "sqs-fargate-consumer-v2/internal/workflow/models"
 
+	"github.com/gdcorp-domains/fulfillment-go-grule-engine/grule"
 	"github.com/gdcorp-domains/fulfillment-rules/ruleset/businesscontext"
 	workflowHelper "github.com/gdcorp-domains/fulfillment-worker-helper"
 	"github.com/google/uuid"
@@ -38,7 +40,11 @@ func NewRegistrarDomainsWorker(deps dependencies.WorkflowDependencies) *Registra
 	}
 }
 
-func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message, enhancedLogger logging.Logger) error {
+func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message, logger logging.Logger) error {
+	enhancedLogger := logger.WithFields(map[string]interface{}{
+		"messageID": message.MessageID,
+		"queueName": message.QueueName,
+	})
 	enhancedLogger.Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
 
 	var wrapper EventWrapper
@@ -87,17 +93,36 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 		return err
 	}
 
+	// Get original knowledge base from the same source InitEngine used
+	originalKB, found := w.Deps.GetKnowledgeBase(engineParams.RulesetConfig.Name, engineParams.RulesetConfig.Version)
+	if !found {
+		return fmt.Errorf("knowledge base not found")
+	}
+
+	// Create fresh knowledge base
+	freshKB := &grule.KnowledgeBase{
+		Name:          originalKB.Name,
+		Version:       originalKB.Version,
+		RuleNode:      originalKB.RuleNode,
+		PanicRecovery: originalKB.PanicRecovery,
+	}
+
 	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, engineParams.DataCtx)
 	if err != nil {
 		enhancedLogger.Errorf("failed to initialize business context: %s", err)
 		return err
 	}
 
-	err = w.Deps.AddBusinessContextToKnowledgeBase(engineParams.RulesetConfig.Name, engineParams.RulesetConfig.Version, bc)
-	if err != nil {
-		enhancedLogger.Errorf("failed to add business context to knowledge base: %s", err)
-		return err
-	}
+	enhancedLogger = enhancedLogger.WithFields(map[string]interface{}{
+		"dataContextAddr":     fmt.Sprintf("%p", engineParams.DataCtx),
+		"businessContextAddr": fmt.Sprintf("%p", bc),
+	})
+
+	// Add new BC
+	freshKB.BusinessContext = bc
+
+	// Init new engine
+	engineParams.Engine = grule.NewEngine(freshKB)
 
 	err = engineParams.Engine.Execute(ctx, engineParams.DataCtx)
 	if err != nil {

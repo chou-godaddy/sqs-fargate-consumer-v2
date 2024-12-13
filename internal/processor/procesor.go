@@ -51,7 +51,7 @@ type Worker struct {
 	lastActive    time.Time
 	mu            sync.RWMutex
 	domainsWorker *workflow.RegistrarDomainsWorker
-	logger        logging.Logger
+	baseLogger    logging.Logger
 }
 
 const (
@@ -114,10 +114,7 @@ func (mp *MessageProcessorImpl) startWorker() error {
 		stopChan:      make(chan struct{}),
 		processor:     mp,
 		domainsWorker: workflow.NewRegistrarDomainsWorker(mp.deps),
-		logger: mp.deps.GetLogger().WithFields(map[string]interface{}{
-			"processorGroupID":  mp.instanceID,
-			"processorWorkerID": workerID,
-		}),
+		baseLogger:    mp.deps.GetLogger(),
 	}
 
 	mp.workers[workerID] = worker
@@ -179,9 +176,11 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	defer cancel()
 
 	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s.", w.id, msg.MessageID, msg.Priority, msg.QueueName)
-	enhancedLogger := w.logger.WithFields(map[string]interface{}{
-		"messageID": msg.MessageID,
-		"queueName": msg.QueueName,
+	enhancedLogger := w.baseLogger.WithFields(map[string]interface{}{
+		"processorGroupID":  w.processor.instanceID,
+		"processorWorkerID": w.id,
+		"messageID":         msg.MessageID,
+		"queueName":         msg.QueueName,
 	})
 
 	// Process the message using the domains worker

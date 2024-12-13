@@ -62,9 +62,6 @@ func (b *MessageBufferImpl) monitorBufferSize() {
 			if b.metricsEmitter != nil {
 				currentSize := len(b.messages)
 				b.metricsEmitter.OnBufferSizeChanged(currentSize, b.capacity)
-
-				usage := float64(currentSize) / float64(b.capacity)
-				log.Printf("[Buffer] Channel utilization: %.2f%% (%d/%d)", usage*100, currentSize, b.capacity)
 			}
 		}
 	}
