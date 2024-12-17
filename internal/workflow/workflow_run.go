@@ -96,6 +96,8 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 		return err
 	}
 
+	originalDataCtx := engineParams.Engine.GetDataContext()
+
 	// Get original knowledge base from the same source InitEngine used
 	originalKB, found := w.Deps.GetKnowledgeBase(engineParams.RulesetConfig.Name, engineParams.RulesetConfig.Version)
 	if !found {
@@ -110,7 +112,7 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 		PanicRecovery: originalKB.PanicRecovery,
 	}
 
-	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, engineParams.Engine.GetDataContext())
+	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, originalDataCtx)
 	if err != nil {
 		logger.Errorf("failed to initialize business context: %s", err)
 		return err
@@ -124,6 +126,8 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 	// Init new engine
 	engineParams.Engine = grule.NewEngine(freshKB)
 	engineParams.Engine.SetBusinessContext(bc)
+	engineParams.Engine.SetDataContext(originalDataCtx)
+	defer engineParams.Engine.GetDataContext().Clear()
 
 	logger.Infof("Before Execute - DataCtx: %p, BusinessCtx %p", engineParams.Engine.GetDataContext(), bc)
 	err = engineParams.Engine.Execute(ctx)
