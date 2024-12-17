@@ -9,8 +9,6 @@ import (
 
 	registrycontacts "github.com/gdcorp-domains/fulfillment-registry-contacts"
 
-	"github.com/gdcorp-domains/fulfillment-rules/ruleset/businesscontext"
-
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -253,11 +251,6 @@ func (dep Dependencies) GetContactVerificationAPIClient() contactverification.Cl
 // GetKnowledgeBase returns the knowledge base for rules
 func (dep Dependencies) GetKnowledgeBase(name, version string) (*grule.KnowledgeBase, bool) {
 	return dep.KnowledgeLibrary.GetKnowledgeBase(name, version)
-}
-
-// AddBusinessContextToKnowledgeBase sets businessCtx in knowledge lib
-func (dep Dependencies) AddBusinessContextToKnowledgeBase(name, version string, businessCtx businesscontext.BusinessContext) error {
-	return dep.KnowledgeLibrary.AddBusinessContextToKnowledgeBase(name, version, businessCtx)
 }
 
 // GetSwitchboardAccessor returns the switchboard accessor

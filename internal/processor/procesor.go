@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
 )
 
 type MessageProcessorImpl struct {
@@ -51,7 +50,6 @@ type Worker struct {
 	lastActive    time.Time
 	mu            sync.RWMutex
 	domainsWorker *workflow.RegistrarDomainsWorker
-	baseLogger    logging.Logger
 }
 
 const (
@@ -114,7 +112,6 @@ func (mp *MessageProcessorImpl) startWorker() error {
 		stopChan:      make(chan struct{}),
 		processor:     mp,
 		domainsWorker: workflow.NewRegistrarDomainsWorker(mp.deps),
-		baseLogger:    mp.deps.GetLogger(),
 	}
 
 	mp.workers[workerID] = worker
@@ -165,6 +162,8 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	if msg == nil {
 		return nil
 	}
+	msg.ProcessorGroupID = w.processor.instanceID
+	msg.ProcessorWorkerID = w.id
 
 	w.status.Store(workerStatusProcessing)
 	defer w.status.Store(workerStatusIdle)
@@ -176,15 +175,9 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	defer cancel()
 
 	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s.", w.id, msg.MessageID, msg.Priority, msg.QueueName)
-	enhancedLogger := w.baseLogger.WithFields(map[string]interface{}{
-		"processorGroupID":  w.processor.instanceID,
-		"processorWorkerID": w.id,
-		"messageID":         msg.MessageID,
-		"queueName":         msg.QueueName,
-	})
 
 	// Process the message using the domains worker
-	if err := w.domainsWorker.HandleWorkflowEvent(processCtx, msg, enhancedLogger); err != nil {
+	if err := w.domainsWorker.HandleWorkflowEvent(processCtx, msg); err != nil {
 		w.processor.collector.RecordError(msg.QueueName)
 		w.processor.errorCount.Add(1)
 		return fmt.Errorf("worker %s failed to process message: %w", w.id, err)

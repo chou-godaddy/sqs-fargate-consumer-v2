@@ -13,12 +13,12 @@ require (
 	github.com/gdcorp-domains/fulfillment-generic-queue-client v1.0.4
 	github.com/gdcorp-domains/fulfillment-go-api v1.0.88
 	github.com/gdcorp-domains/fulfillment-go-grule-engine v1.0.19
-	github.com/gdcorp-domains/fulfillment-goapimodels v1.0.110
-	github.com/gdcorp-domains/fulfillment-golang-clients v1.0.129
-	github.com/gdcorp-domains/fulfillment-golang-httpclient v1.0.84
+	github.com/gdcorp-domains/fulfillment-goapimodels v1.0.112
+	github.com/gdcorp-domains/fulfillment-golang-clients v1.0.132
+	github.com/gdcorp-domains/fulfillment-golang-httpclient v1.0.85
 	github.com/gdcorp-domains/fulfillment-golang-logging v1.0.21
 	github.com/gdcorp-domains/fulfillment-golang-sql-interfaces v1.0.11
-	github.com/gdcorp-domains/fulfillment-registrar-config v1.0.57
+	github.com/gdcorp-domains/fulfillment-registrar-config v1.0.58
 	github.com/gdcorp-domains/fulfillment-registrar-contact-verification v1.0.62
 	github.com/gdcorp-domains/fulfillment-registrar-domains v1.0.14
 	github.com/gdcorp-domains/fulfillment-registry-contacts v1.0.23
@@ -62,6 +62,7 @@ require (
 	github.com/elastic/go-sysinfo v1.14.0 // indirect
 	github.com/elastic/go-windows v1.0.1 // indirect
 	github.com/facebookgo/stack v0.0.0-20160209184415-751773369052 // indirect
+	github.com/fsnotify/fsnotify v1.8.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.6 // indirect
 	github.com/gdcorp-domains/fulfillment-command-factory v0.14.51 // indirect
 	github.com/gdcorp-domains/fulfillment-contact-eligibility v1.0.11 // indirect
@@ -132,9 +133,9 @@ require (
 	golang.org/x/sys v0.26.0 // indirect
 	golang.org/x/text v0.19.0 // indirect
 	golang.org/x/tools v0.26.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240604185151-ef581f913117 // indirect
-	google.golang.org/grpc v1.64.0 // indirect
-	google.golang.org/protobuf v1.34.1 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20241104194629-dd2ea8efbc28 // indirect
+	google.golang.org/grpc v1.64.1 // indirect
+	google.golang.org/protobuf v1.35.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	howett.net/plist v1.0.1 // indirect
 )
@@ -142,3 +143,5 @@ require (
 replace github.com/gdcorp-domains/fulfillment-go-grule-engine v1.0.19 => /Users/chou/Desktop/godaddy/gdcorp-domains/fulfillment-go-grule-engine
 
 replace github.com/gdcorp-domains/fulfillment-rules v1.0.381 => /Users/chou/Desktop/godaddy/gdcorp-domains/fulfillment-rules
+
+replace github.com/gdcorp-domains/fulfillment-worker-helper v1.0.17 => /Users/chou/Desktop/godaddy/gdcorp-domains/fulfillment-worker-helper

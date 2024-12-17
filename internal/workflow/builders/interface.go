@@ -77,6 +77,7 @@ func (builder *loggerAndContextDecorator) DecorateLoggerAndContext(ctx context.C
 				fields["CurrentStatus"] = domainEventInput.AgentMessage.AgentEvent.CurrentStatus
 				fields["PreviousStatus"] = domainEventInput.AgentMessage.AgentEvent.PreviousStatus
 				fields["RetryCount"] = domainEventInput.AgentMessage.AgentEvent.RetryCount
+				fields["RfdEventID"] = domainEventInput.AgentMessage.AgentEvent.ID
 			}
 		}
 		// TODO: Add more fields for Domainbox or add them to workflow_sync_run

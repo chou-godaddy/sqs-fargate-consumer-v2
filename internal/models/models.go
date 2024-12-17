@@ -33,16 +33,18 @@ type QueueMetrics struct {
 
 // Message represents a wrapped SQS message with metadata
 type Message struct {
-	QueueURL      string
-	QueueName     string
-	Priority      Priority
-	MessageID     string
-	Body          []byte
-	ReceiptHandle *string
-	Size          int64
-	ReceivedAt    time.Time
-	EnqueuedAt    time.Time
-	RetryCount    int
+	QueueURL          string
+	QueueName         string
+	Priority          Priority
+	MessageID         string
+	Body              []byte
+	ReceiptHandle     *string
+	Size              int64
+	ReceivedAt        time.Time
+	EnqueuedAt        time.Time
+	RetryCount        int
+	ProcessorGroupID  string
+	ProcessorWorkerID string
 }
 
 // BufferMetrics represents buffer utilization metrics

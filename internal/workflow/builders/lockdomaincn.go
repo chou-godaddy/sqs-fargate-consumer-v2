@@ -74,6 +74,18 @@ func (cr *lockDomainCNActionCreator) BuildDataContext(rulesetName string, worker
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create new data context, err: %s", err)
 	}
+
+	metaStore := state.NewMetaStore()
+	dataCtx.Add(rule.MetaStoreKey, metaStore)
+	logger.Debugf("Add new metastore %p in dataCtx %p", metaStore, dataCtx)
+
+	logger = logger.WithFields(map[string]interface{}{
+		"MetastoreAddr": fmt.Sprintf("%p", metaStore),
+		"DataCtxAddr":   fmt.Sprintf("%p", dataCtx),
+	})
+
+	dataCtx.Add(rule.LoggerKey, logger)
+
 	if domainEvent.UpdateLocksActionInput != nil {
 		var eppStatusListStr []string
 		for _, eppStatus := range domainEvent.LocksToAddOrRemove {
@@ -84,18 +96,8 @@ func (cr *lockDomainCNActionCreator) BuildDataContext(rulesetName string, worker
 		return nil, errors.New("UpdateLocksActionInput is empty")
 	}
 
-	metaStore := state.NewMetaStore()
-	logger = logger.WithFields(map[string]interface{}{
-		"metastoreAddr": fmt.Sprintf("%p", metaStore),
-		"RfdEventID":    domainEvent.AgentMessage.AgentEvent.ID,
-	})
-	logger.Debugf("Created new metastore %p in BuildDataContext", metaStore)
-
 	dataAccessor := NewDataAccessor(deps, metaStore, domainEvent.AgentMessage.Registrar, domainEvent.CustomerID, logger).GetDataAccessor(domainEvent.RegistrarBackend)
 
-	logger.Debugf("Passed metastore %p to DataAccessor", metaStore)
-	dataCtx.Add(rule.MetaStoreKey, metaStore)
-	logger.Debugf("Added metastore %p to dataCtx", metaStore)
 	dataCtx.Add(rule.RegistryContactsClientKey, deps.GetRegistryContactsClient())
 	dataCtx.Add(rule.RegistryDomainsClientKey, deps.GetRegistryDomainsClient())
 	dataCtx.Add(rule.AgentMessageKey, domainEvent.AgentMessage)

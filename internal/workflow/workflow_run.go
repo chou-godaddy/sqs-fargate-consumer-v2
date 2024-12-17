@@ -9,7 +9,6 @@ import (
 
 	actionmodel "github.com/gdcorp-domains/fulfillment-ags3-workflow/models"
 	actionstatus "github.com/gdcorp-domains/fulfillment-ags3-workflow/models/status"
-	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
 
 	"github.com/gdcorp-domains/fulfillment-go-grule-engine/repository"
 
@@ -40,12 +39,16 @@ func NewRegistrarDomainsWorker(deps dependencies.WorkflowDependencies) *Registra
 	}
 }
 
-func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message, logger logging.Logger) error {
-	enhancedLogger := logger.WithFields(map[string]interface{}{
-		"messageID": message.MessageID,
-		"queueName": message.QueueName,
+func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message) error {
+	logger := w.Deps.GetLogger().WithFields(map[string]interface{}{
+		"MessageID":         message.MessageID,
+		"QueueName":         message.QueueName,
+		"ProcessorGroupID":  message.ProcessorGroupID,
+		"ProcessorWorkerID": message.ProcessorWorkerID,
+		"ReceiptHandle":     *message.ReceiptHandle,
 	})
-	enhancedLogger.Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
+
+	logger.Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
 
 	var wrapper EventWrapper
 	if err := json.Unmarshal([]byte(message.Body), &wrapper); err != nil {
@@ -60,12 +63,12 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 
 	action, code, err := w.Deps.GetActionAPIClient().GetAction(ctx, eventMessage.ActionID, eventMessage.CustomerID, "input", "customerId")
 	if err != nil {
-		enhancedLogger.Errorf("Failed to get action record with actionID %s, customerID %s, http code: %d, err: %s", eventMessage.ActionID, eventMessage.CustomerID, code, err)
+		logger.Errorf("Failed to get action record with actionID %s, customerID %s, http code: %d, err: %s", eventMessage.ActionID, eventMessage.CustomerID, code, err)
 		return err
 	}
 
 	if action.Status == actionstatus.Success {
-		enhancedLogger.Errorf("Action record with actionID %s, customerID %s is in SUCCESS status, skipping", eventMessage.ActionID, eventMessage.CustomerID)
+		logger.Errorf("Action record with actionID %s, customerID %s is in SUCCESS status, skipping", eventMessage.ActionID, eventMessage.CustomerID)
 		return nil
 	}
 
@@ -76,13 +79,13 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 		b, _ := json.Marshal(action.Input)
 		err := json.Unmarshal(b, &domainEventInput)
 		if err != nil {
-			enhancedLogger.Errorf("failed to unmarshal action input due to error: %s", err.Error())
+			logger.Errorf("failed to unmarshal action input due to error: %s", err.Error())
 			return err
 		}
 	}
 	action.Input = &domainEventInput
 
-	helper := workflowHelper.NewWorkflowHelper(action, w.Deps.GetBaseDependencies(), enhancedLogger)
+	helper := workflowHelper.NewWorkflowHelper(action, w.Deps.GetBaseDependencies(), logger)
 
 	factory := builders.NewBuilderRetriever()
 
@@ -107,29 +110,28 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 		PanicRecovery: originalKB.PanicRecovery,
 	}
 
-	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, engineParams.DataCtx)
+	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, engineParams.Engine.GetDataContext())
 	if err != nil {
-		enhancedLogger.Errorf("failed to initialize business context: %s", err)
+		logger.Errorf("failed to initialize business context: %s", err)
 		return err
 	}
 
-	enhancedLogger = enhancedLogger.WithFields(map[string]interface{}{
-		"dataContextAddr":     fmt.Sprintf("%p", engineParams.DataCtx),
-		"businessContextAddr": fmt.Sprintf("%p", bc),
+	logger = logger.WithFields(map[string]interface{}{
+		"DataContextAddr":     fmt.Sprintf("%p", engineParams.Engine.GetDataContext()),
+		"BusinessContextAddr": fmt.Sprintf("%p", bc),
 	})
-
-	// Add new BC
-	freshKB.BusinessContext = bc
 
 	// Init new engine
 	engineParams.Engine = grule.NewEngine(freshKB)
+	engineParams.Engine.SetBusinessContext(bc)
 
-	err = engineParams.Engine.Execute(ctx, engineParams.DataCtx)
+	logger.Infof("Before Execute - DataCtx: %p, BusinessCtx %p", engineParams.Engine.GetDataContext(), bc)
+	err = engineParams.Engine.Execute(ctx)
 	if err != nil {
 		return err
 	}
 
-	domainEventInput.LastFunctionGraph = engineParams.DataCtx.Get("FunctionGraph").(*string)
+	domainEventInput.LastFunctionGraph = engineParams.Engine.GetDataContext().Get("FunctionGraph").(*string)
 
 	err = helper.UpdateAction(ctx, domainEventInput, actionstatus.Success)
 	if err != nil {

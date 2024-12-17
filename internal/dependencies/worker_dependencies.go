@@ -17,7 +17,6 @@ import (
 	registrycontacts "github.com/gdcorp-domains/fulfillment-registry-contacts"
 	registrydomains "github.com/gdcorp-domains/fulfillment-registry-domains"
 	rgclient "github.com/gdcorp-domains/fulfillment-rg-client"
-	"github.com/gdcorp-domains/fulfillment-rules/ruleset/businesscontext"
 	workerhelper "github.com/gdcorp-domains/fulfillment-worker-helper"
 	workflowHelper "github.com/gdcorp-domains/fulfillment-worker-helper"
 )
@@ -32,7 +31,6 @@ type WorkflowDependencies interface {
 	GetRegistryContactsClient() registrycontacts.Client
 	GetRegistryDomainsClient() registrydomains.Client
 	GetKnowledgeBase(name, version string) (*grule.KnowledgeBase, bool)
-	AddBusinessContextToKnowledgeBase(name, version string, businessCtx businesscontext.BusinessContext) error
 	GetSwitchboardAccessor() switchboard.Accessor
 	GetSBConfigGetter() workerhelper.SBConfigGetter
 	GetDBConnection() sqlinterfaces.DatabaseConnection
