@@ -9,17 +9,25 @@ import (
 
 	actionmodel "github.com/gdcorp-domains/fulfillment-ags3-workflow/models"
 	actionstatus "github.com/gdcorp-domains/fulfillment-ags3-workflow/models/status"
+	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
 
 	"github.com/gdcorp-domains/fulfillment-go-grule-engine/repository"
 
 	bufferMessageModels "sqs-fargate-consumer-v2/internal/models"
 	workflowModels "sqs-fargate-consumer-v2/internal/workflow/models"
 
-	"github.com/gdcorp-domains/fulfillment-go-grule-engine/grule"
+	"github.com/gdcorp-domains/fulfillment-rules/rule"
 	"github.com/gdcorp-domains/fulfillment-rules/ruleset/businesscontext"
 	workflowHelper "github.com/gdcorp-domains/fulfillment-worker-helper"
 	"github.com/google/uuid"
 )
+
+type messageExecutionContext struct {
+	MessageID       string
+	DataCtxAddr     string
+	MetastoreAddr   string
+	BusinessCtxAddr string
+}
 
 type EventWrapper struct {
 	Detail struct {
@@ -40,20 +48,27 @@ func NewRegistrarDomainsWorker(deps dependencies.WorkflowDependencies) *Registra
 }
 
 func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, message *bufferMessageModels.Message) error {
-	logger := w.Deps.GetLogger().WithFields(map[string]interface{}{
-		"MessageID":         message.MessageID,
-		"QueueName":         message.QueueName,
-		"ProcessorGroupID":  message.ProcessorGroupID,
-		"ProcessorWorkerID": message.ProcessorWorkerID,
-		"ReceiptHandle":     *message.ReceiptHandle,
-	})
+	logger := ctx.Value("logger").(logging.Logger)
 
-	logger.Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
+	logger.Infof("Starting HandleWorkflowEvent execution")
 
 	var wrapper EventWrapper
 	if err := json.Unmarshal([]byte(message.Body), &wrapper); err != nil {
 		return err
 	}
+
+	// Create execution context
+	execCtx := &messageExecutionContext{
+		MessageID: message.MessageID,
+	}
+
+	// Enhance logger with execution context
+	logger = logger.WithFields(map[string]interface{}{
+		"ReceiptHandle":    *message.ReceiptHandle,
+		"ExecutionContext": fmt.Sprintf("%p", execCtx),
+	})
+
+	logger.Infof("Processing message %s for event source %s = %s", message.MessageID, *message.ReceiptHandle, message.Body)
 
 	eventMessage := actionmodel.EventMessage{
 		CustomerID: wrapper.Detail.CustomerID,
@@ -91,47 +106,46 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 
 	loggerContextDecorator := builders.NewLoggerContextDecorator()
 
+	logger.Infof("Initializing engine")
 	engineParams, err := helper.InitEngine(ctx, w.Deps, loggerContextDecorator, factory)
 	if err != nil {
 		return err
 	}
 
-	originalDataCtx := engineParams.Engine.GetDataContext()
-
-	// Get original knowledge base from the same source InitEngine used
-	originalKB, found := w.Deps.GetKnowledgeBase(engineParams.RulesetConfig.Name, engineParams.RulesetConfig.Version)
-	if !found {
-		return fmt.Errorf("knowledge base not found")
+	// Track isolated resources
+	execCtx.DataCtxAddr = fmt.Sprintf("%p", engineParams.Engine.GetDataContext())
+	if ms := engineParams.Engine.GetDataContext().Get(rule.MetaStoreKey); ms != nil {
+		execCtx.MetastoreAddr = fmt.Sprintf("%p", ms)
 	}
 
-	// Create fresh knowledge base
-	freshKB := &grule.KnowledgeBase{
-		Name:          originalKB.Name,
-		Version:       originalKB.Version,
-		RuleNode:      originalKB.RuleNode,
-		PanicRecovery: originalKB.PanicRecovery,
-	}
-
-	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, originalDataCtx)
+	logger.Infof("Initializing business context")
+	bc, err := InitializeBusinessContextByType(engineParams.RulesetConfig, engineParams.Engine.GetDataContext())
 	if err != nil {
 		logger.Errorf("failed to initialize business context: %s", err)
 		return err
 	}
 
+	execCtx.BusinessCtxAddr = fmt.Sprintf("%p", bc)
+
 	logger = logger.WithFields(map[string]interface{}{
-		"DataContextAddr":     fmt.Sprintf("%p", engineParams.Engine.GetDataContext()),
-		"BusinessContextAddr": fmt.Sprintf("%p", bc),
+		"DataContextAddr":     execCtx.DataCtxAddr,
+		"BusinessContextAddr": execCtx.BusinessCtxAddr,
+		"MetastoreAddr":       execCtx.MetastoreAddr,
+		"MessageExecCtxAddr":  fmt.Sprintf("%p", execCtx),
 	})
 
-	// Init new engine
-	engineParams.Engine = grule.NewEngine(freshKB)
+	engineParams.Engine.GetDataContext().Add("Logger", logger)
+
+	logger.Infof("Created isolated execution context for message %s", execCtx.MessageID)
+
+	// Init new engine with business context
 	engineParams.Engine.SetBusinessContext(bc)
-	engineParams.Engine.SetDataContext(originalDataCtx)
 	defer engineParams.Engine.GetDataContext().Clear()
 
-	logger.Infof("Before Execute - DataCtx: %p, BusinessCtx %p", engineParams.Engine.GetDataContext(), bc)
+	logger.Infof("Executing engine with isolated contexts")
 	err = engineParams.Engine.Execute(ctx)
 	if err != nil {
+		logger.Errorf("Rule execution failed: %s", err.Error())
 		return err
 	}
 
@@ -139,9 +153,11 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 
 	err = helper.UpdateAction(ctx, domainEventInput, actionstatus.Success)
 	if err != nil {
+		logger.Errorf("Failed to update action: %s", err.Error())
 		return err
 	}
 
+	logger.Infof("Successfully completed message execution with context %p", execCtx)
 	return nil
 }
 

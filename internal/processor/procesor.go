@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
 )
 
 type MessageProcessorImpl struct {
@@ -50,6 +51,7 @@ type Worker struct {
 	lastActive    time.Time
 	mu            sync.RWMutex
 	domainsWorker *workflow.RegistrarDomainsWorker
+	currentMsg    atomic.Value
 }
 
 const (
@@ -165,14 +167,35 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	msg.ProcessorGroupID = w.processor.instanceID
 	msg.ProcessorWorkerID = w.id
 
+	logger := w.processor.deps.GetLogger().WithFields(map[string]interface{}{
+		"ProcessorGroupID":  w.processor.instanceID,
+		"ProcessorWorkerID": w.id,
+		"MessageID":         msg.MessageID,
+		"QueueName":         msg.QueueName,
+	})
+
+	// Set current message
+	prevMsg := w.currentMsg.Swap(msg.MessageID)
+	if prevMsg != nil {
+		logger.Warnf("Worker still has previous message %s when starting new message %s", prevMsg, msg.MessageID)
+	}
+	defer w.currentMsg.Store("")
+
 	w.status.Store(workerStatusProcessing)
 	defer w.status.Store(workerStatusIdle)
 
 	startTime := time.Now()
 
 	// Process message with timeout
-	processCtx, cancel := context.WithTimeout(ctx, w.processor.config.ProcessTimeout.Duration)
+	processCtx := context.WithValue(ctx, "workerID", w.id)
+	processCtx = context.WithValue(processCtx, "messageID", msg.MessageID)
+	processCtx = context.WithValue(processCtx, "logger", logger)
+	processCtx, cancel := context.WithTimeout(processCtx, w.processor.config.ProcessTimeout.Duration)
 	defer cancel()
+
+	if err := w.verifyMessageOwnership(processCtx, logger); err != nil {
+		return fmt.Errorf("message ownership verification failed: %w", err)
+	}
 
 	log.Printf("[Worker %s] Processing message id %s, priority %d from queue %s.", w.id, msg.MessageID, msg.Priority, msg.QueueName)
 
@@ -203,6 +226,25 @@ func (w *Worker) processMessage(ctx context.Context) error {
 
 	log.Printf("[Worker %s] Successfully processed message id %s in %v", w.id, msg.MessageID, processingDuration)
 
+	return nil
+}
+
+func (w *Worker) verifyMessageOwnership(ctx context.Context, logger logging.Logger) error {
+	workerID := ctx.Value("workerID").(string)
+	messageID := ctx.Value("messageID").(string)
+	currentMsg := w.currentMsg.Load()
+
+	logger.Infof("Verifying message ownership - Worker: %s, Current: %v, Processing: %s",
+		workerID, currentMsg, messageID)
+
+	if currentMsg != messageID {
+		err := fmt.Errorf("worker %s attempting to process message %s but owns message %s",
+			workerID, messageID, currentMsg)
+		logger.Errorf("Message ownership violation: %v", err)
+		return err
+	}
+
+	logger.Debugf("Message ownership verified")
 	return nil
 }
 
