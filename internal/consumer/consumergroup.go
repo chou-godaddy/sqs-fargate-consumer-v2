@@ -90,8 +90,10 @@ func (cg *ConsumerGroup) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start scaling routine
-	go cg.monitorAndScale()
+	if cg.config.MinWorkers < cg.config.MaxWorkers {
+		// Start scaling routine
+		go cg.monitorAndScale()
+	}
 
 	return nil
 }

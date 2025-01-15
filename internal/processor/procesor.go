@@ -94,8 +94,10 @@ func (mp *MessageProcessorImpl) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start scaling routine
-	go mp.monitorAndScale()
+	if mp.config.MinWorkers < mp.config.MaxWorkers {
+		// Start scaling routine
+		go mp.monitorAndScale()
+	}
 
 	return nil
 }
@@ -176,7 +178,7 @@ func (w *Worker) processMessage(ctx context.Context) error {
 
 	// Set current message
 	prevMsg := w.currentMsg.Swap(msg.MessageID)
-	if prevMsg != nil {
+	if prevMsg != nil && prevMsg != "" {
 		logger.Warnf("Worker still has previous message %s when starting new message %s", prevMsg, msg.MessageID)
 	}
 	defer w.currentMsg.Store("")
