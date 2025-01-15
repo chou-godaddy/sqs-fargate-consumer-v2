@@ -8,6 +8,7 @@ import (
 	"sqs-fargate-consumer-v2/internal/dependencies"
 	"sqs-fargate-consumer-v2/internal/interfaces"
 	"sqs-fargate-consumer-v2/internal/models"
+	"sqs-fargate-consumer-v2/internal/registrypool"
 	"sqs-fargate-consumer-v2/internal/workflow"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ type MessageProcessorImpl struct {
 	deps                   dependencies.WorkflowDependencies
 	collector              interfaces.MetricsCollector
 	bufferMetricsCollector interfaces.BufferMetricsCollector
+	registryPoolManager    *registrypool.RegistryPoolManager
 
 	workers     map[string]*Worker
 	workerCount atomic.Int32
@@ -43,21 +45,23 @@ type MessageProcessorImpl struct {
 }
 
 type Worker struct {
-	id            string
-	status        atomic.Int32
-	msgCount      atomic.Int64
-	stopChan      chan struct{}
-	processor     *MessageProcessorImpl
-	lastActive    time.Time
-	mu            sync.RWMutex
-	domainsWorker *workflow.RegistrarDomainsWorker
-	currentMsg    atomic.Value
+	id                  string
+	status              atomic.Int32
+	msgCount            atomic.Int64
+	stopChan            chan struct{}
+	processor           *MessageProcessorImpl
+	lastActive          time.Time
+	mu                  sync.RWMutex
+	domainsWorker       *workflow.RegistrarDomainsWorker
+	currentMsg          atomic.Value
+	registryPoolManager *registrypool.RegistryPoolManager
 }
 
 const (
 	workerStatusIdle int32 = iota
 	workerStatusProcessing
 	workerStatusStopped
+	workerStatusWaitingForRegistry
 )
 
 func NewMessageProcessor(
@@ -66,6 +70,7 @@ func NewMessageProcessor(
 	deps dependencies.WorkflowDependencies,
 	collector interfaces.MetricsCollector,
 	bufferMetricsCollector interfaces.BufferMetricsCollector,
+	registryPoolManager *registrypool.RegistryPoolManager,
 ) interfaces.MessageProcessor {
 	instanceID := fmt.Sprintf("processor-group-%d", time.Now().UnixNano())
 	log.Printf("[ProcessorGroup] Creating new instance: %s", instanceID)
@@ -81,10 +86,12 @@ func NewMessageProcessor(
 		ctx:                    ctx,
 		cancelFunc:             cancel,
 		bufferMetricsCollector: bufferMetricsCollector,
+		registryPoolManager:    registryPoolManager,
 	}
 }
 
 func (mp *MessageProcessorImpl) Start(ctx context.Context) error {
+	mp.ctx, mp.cancelFunc = context.WithCancel(ctx)
 	log.Printf("[Processor %s] Starting with initial workers: %d", mp.instanceID, mp.config.MinWorkers)
 
 	// Start initial workers
@@ -112,10 +119,11 @@ func (mp *MessageProcessorImpl) startWorker() error {
 
 	workerID := fmt.Sprintf("processor-worker-%d", time.Now().UnixNano())
 	worker := &Worker{
-		id:            workerID,
-		stopChan:      make(chan struct{}),
-		processor:     mp,
-		domainsWorker: workflow.NewRegistrarDomainsWorker(mp.deps),
+		id:                  workerID,
+		stopChan:            make(chan struct{}),
+		processor:           mp,
+		domainsWorker:       workflow.NewRegistrarDomainsWorker(mp.deps),
+		registryPoolManager: mp.registryPoolManager,
 	}
 
 	mp.workers[workerID] = worker
@@ -166,6 +174,26 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	if msg == nil {
 		return nil
 	}
+
+	// Determine registry type
+	registryType := w.registryPoolManager.DetermineRegistryType(msg)
+	pool, exists := w.registryPoolManager.GetPool(registryType)
+	if !exists {
+		log.Printf("[Worker %s] No pool found for registry type: %s", w.id, registryType)
+		return fmt.Errorf("no pool found for registry type: %s", registryType)
+	}
+
+	// Set status to waiting for rate limiter
+	w.status.Store(workerStatusWaitingForRegistry)
+
+	// This will block until rate limit allows
+	log.Printf("[Worker %s] Acquiring rate limit for registry type: %s", w.id, registryType)
+	if err := pool.Acquire(ctx); err != nil {
+		w.status.Store(workerStatusIdle)
+		log.Printf("[Worker %s] Rate limit acquisition failed: %v", w.id, err)
+		return fmt.Errorf("rate limit acquisition failed: %w", err)
+	}
+
 	msg.ProcessorGroupID = w.processor.instanceID
 	msg.ProcessorWorkerID = w.id
 
@@ -208,6 +236,8 @@ func (w *Worker) processMessage(ctx context.Context) error {
 		return fmt.Errorf("worker %s failed to process message: %w", w.id, err)
 	}
 
+	processingDuration := time.Since(startTime)
+
 	// Delete message from SQS after successful processing
 	if err := w.deleteMessage(processCtx, msg); err != nil {
 		w.processor.collector.RecordError(msg.QueueName)
@@ -222,7 +252,6 @@ func (w *Worker) processMessage(ctx context.Context) error {
 	w.mu.Unlock()
 
 	// Record processing metrics
-	processingDuration := time.Since(startTime)
 	w.processor.processedCount.Add(1)
 	w.processor.collector.RecordProcessed(msg.QueueName, processingDuration)
 

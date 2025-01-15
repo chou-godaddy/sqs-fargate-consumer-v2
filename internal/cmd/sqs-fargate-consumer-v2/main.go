@@ -16,6 +16,7 @@ import (
 	"sqs-fargate-consumer-v2/internal/interfaces"
 	"sqs-fargate-consumer-v2/internal/metrics"
 	"sqs-fargate-consumer-v2/internal/processor"
+	"sqs-fargate-consumer-v2/internal/registrypool"
 	"sqs-fargate-consumer-v2/internal/scheduler"
 
 	goapi "github.com/gdcorp-domains/fulfillment-go-api"
@@ -57,6 +58,11 @@ func main() {
 		}
 	}()
 
+	registryConfigs := map[registrypool.RegistryType]registrypool.RegistryConfig{
+		registrypool.RegistryVerisign: {RatePerSecond: 20},
+	}
+	poolManager := registrypool.NewRegistryPoolManager(registryConfigs)
+
 	// Create message buffer
 	buffer := consumer.NewMessageBuffer(cfg.Buffer)
 
@@ -74,7 +80,7 @@ func main() {
 	consumerGroup := consumer.NewConsumerGroup(cfg.Consumer, dep.SQSClient, scheduler, buffer, collector, bufferMetrcisCollector)
 
 	// Create message processor
-	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep, collector, bufferMetrcisCollector)
+	processor := processor.NewMessageProcessor(cfg.Processor, buffer, dep, collector, bufferMetrcisCollector, poolManager)
 
 	// Create root context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())

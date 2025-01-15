@@ -29,6 +29,7 @@ require (
 	github.com/gdcorp-domains/fulfillment-worker-helper v1.0.17
 	github.com/gdcorp-uxp/switchboard-client/go/switchboard v1.9.0
 	github.com/google/uuid v1.6.0
+	go.uber.org/ratelimit v0.3.1
 )
 
 require (
@@ -51,6 +52,7 @@ require (
 	github.com/aws/smithy-go v1.22.1 // indirect
 	github.com/awslabs/aws-lambda-go-api-proxy v0.13.3 // indirect
 	github.com/awslabs/kinesis-aggregation/go v0.0.0-20230808105340-e631fe742486 // indirect
+	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874 // indirect
 	github.com/bytedance/sonic v1.11.8 // indirect
 	github.com/bytedance/sonic/loader v0.1.1 // indirect

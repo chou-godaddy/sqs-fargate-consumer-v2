@@ -81,6 +81,7 @@ func NewConsumerGroup(
 }
 
 func (cg *ConsumerGroup) Start(ctx context.Context) error {
+	cg.ctx, cg.cancelFunc = context.WithCancel(ctx)
 	log.Printf("[ConsumerGroup] Starting with initial workers: %d", cg.config.MinWorkers)
 
 	// Start initial workers
