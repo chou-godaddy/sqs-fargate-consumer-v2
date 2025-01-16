@@ -9,13 +9,13 @@
       "json": true
     },
     "monitoring": {
-      "enabled": false,
+      "enabled": true,
       "APMSecret": "essp_apm_deployment"
     },
     "httpConfig": {
       "MaxConnections": 6000,
       "TimeoutMs": 90000,
-      "APMEnabled": false
+      "APMEnabled": true
     },
     "server": {
       "apiType": "GIN",
@@ -111,8 +111,8 @@
     "pprofEnabled": true,
     "genericQueueEndpointUrl": {{if eq .Env "dev"}}"https://agentservices.phx3.int.dev-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "test"}}"https://agentservices.phx3.int.test-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{ else if eq .Env "prod" }}"https://agentservices.api.phx3.int.godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{else if eq .Env "ote"}}"https://agentservices.api.phx3.int.ote-godaddy.com/RegGenericQueueWebSvc/RegGenericQueueWebSvc.asmx"{{end}},
     "consumer": {
-        "maxWorkers": 150,
-        "minWorkers": 20,
+        "maxWorkers": 300,
+        "minWorkers": 300,
         "maxBatchSize": 10,
         "minpollInterval": "10ms",
         "pollBackoffInterval": "1s",
@@ -155,8 +155,8 @@
         "scaleThreshold": 0.7
     },
     "processor": {
-        "maxWorkers": 500,
-        "minWorkers": 50,
+        "maxWorkers": 300,
+        "minWorkers": 300,
         "processTimeout": "90s",
         "scaleInterval": "1s",
         "scaleThreshold": 0.7,

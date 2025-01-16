@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"sqs-fargate-consumer-v2/internal/dependencies"
 	"sqs-fargate-consumer-v2/internal/workflow/builders"
+	"time"
 
 	actionmodel "github.com/gdcorp-domains/fulfillment-ags3-workflow/models"
 	actionstatus "github.com/gdcorp-domains/fulfillment-ags3-workflow/models/status"
 	logging "github.com/gdcorp-domains/fulfillment-golang-logging"
+	"go.elastic.co/apm"
 
 	"github.com/gdcorp-domains/fulfillment-go-grule-engine/repository"
 
@@ -27,6 +29,7 @@ type messageExecutionContext struct {
 	DataCtxAddr     string
 	MetastoreAddr   string
 	BusinessCtxAddr string
+	nonBlocking     chan struct{}
 }
 
 type EventWrapper struct {
@@ -59,8 +62,10 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 
 	// Create execution context
 	execCtx := &messageExecutionContext{
-		MessageID: message.MessageID,
+		MessageID:   message.MessageID,
+		nonBlocking: make(chan struct{}),
 	}
+	close(execCtx.nonBlocking)
 
 	// Enhance logger with execution context
 	logger = logger.WithFields(map[string]interface{}{
@@ -142,8 +147,21 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 	engineParams.Engine.SetBusinessContext(bc)
 	defer engineParams.Engine.GetDataContext().Clear()
 
+	updatedCtx := engineParams.Context
+	if w.Deps.GetAPMTracer() != nil {
+		apmTransaction := w.Deps.GetAPMTracer().StartTransaction(engineParams.RulesetConfig.Name, "WorkflowRun")
+		updatedCtx = apm.ContextWithTransaction(updatedCtx, apmTransaction)
+		defer w.Deps.GetAPMTracer().Flush(execCtx.nonBlocking)
+		defer apmTransaction.End()
+
+		var span *apm.Span
+		span, updatedCtx = apm.StartSpan(updatedCtx, "rulesetExecutionSpan", "ruleset")
+		defer span.End()
+	}
+
 	logger.Infof("Executing engine with isolated contexts")
-	err = engineParams.Engine.Execute(ctx)
+	now := time.Now()
+	err = engineParams.Engine.Execute(updatedCtx)
 	if err != nil {
 		logger.Errorf("Rule execution failed: %s", err.Error())
 		return err
@@ -157,7 +175,9 @@ func (w *RegistrarDomainsWorker) HandleWorkflowEvent(ctx context.Context, messag
 		return err
 	}
 
-	logger.Infof("Successfully completed message execution with context %p", execCtx)
+	processingDuration := time.Since(now)
+
+	logger.Infof("Successfully completed message execution with context %p in %v", execCtx, processingDuration)
 	return nil
 }
 

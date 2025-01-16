@@ -2,6 +2,7 @@ package dependencies
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sqs-fargate-consumer-v2/internal/config"
 
@@ -11,6 +12,7 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	actionapi "github.com/gdcorp-domains/fulfillment-ags3-workflow/client"
 	msmqclient "github.com/gdcorp-domains/fulfillment-generic-queue-client/client"
@@ -31,6 +33,8 @@ import (
 	sqldata "github.com/gdcorp-domains/fulfillment-sql-data-api-client"
 	workerhelper "github.com/gdcorp-domains/fulfillment-worker-helper"
 	switchboardclient "github.com/gdcorp-uxp/switchboard-client/go/switchboard"
+	"go.elastic.co/apm"
+	"go.elastic.co/apm/transport"
 )
 
 // Dependencies encapsulates all dependencies to be carried through request processing.
@@ -56,6 +60,7 @@ type Dependencies struct {
 	SQSClient                    *sqs.Client
 	CloudwatchClient             *cloudwatch.Client
 	ContactVerificationAPIClient contactverification.Client
+	APMTracer                    *apm.Tracer
 }
 
 // Initialize takes the static dependencies and does any one-time setup
@@ -150,6 +155,55 @@ func (dep *Dependencies) Initialize(static *goapi.StaticDependencies) {
 	// Initialize AWS clients
 	dep.SQSClient = sqs.NewFromConfig(awsCfg)
 	dep.CloudwatchClient = cloudwatch.NewFromConfig(awsCfg)
+	secretsmanagerClient := secretsmanager.NewFromConfig(awsCfg)
+
+	if cfg.Monitoring.Enabled && cfg.Monitoring.APMSecret != "" {
+		apm.DefaultTracer.Close()
+		dep.APMTracer, err = setupWorkerAPMTracer(cfg, secretsmanagerClient)
+		if err != nil {
+			panic(fmt.Errorf("Failed to setup APM Tracer: %v", err))
+		}
+		fmt.Println("\nAPM Tracer initialized")
+	}
+}
+
+func setupWorkerAPMTracer(cfg *config.Config, secretsmanagerClient *secretsmanager.Client) (*apm.Tracer, error) {
+	apmCfg, err := retrieveAPMConfig(secretsmanagerClient, cfg.Monitoring.APMSecret)
+	if err != nil {
+		return nil, err
+	}
+
+	t := transport.Default.(*transport.HTTPTransport)
+	t.SetServerURL(apmCfg.ServerURL)
+	t.SetSecretToken(apmCfg.Token)
+
+	apmTracer, err := apm.NewTracerOptions(apm.TracerOptions{
+		Transport:          t,
+		ServiceName:        cfg.APIName,
+		ServiceEnvironment: cfg.Env,
+	})
+	if err != nil {
+		panic(fmt.Errorf("Failed to create APM Tracer: %v", err))
+	}
+	apm.DefaultTracer = apmTracer
+	transport.Default = t
+
+	return apmTracer, err
+}
+
+func retrieveAPMConfig(smClient *secretsmanager.Client, secretName string) (*goapi.APMConfig, error) {
+	out, err := smClient.GetSecretValue(context.Background(), &secretsmanager.GetSecretValueInput{
+		SecretId: &secretName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	apmCfg := goapi.APMConfig{}
+	err = json.Unmarshal([]byte(*out.SecretString), &apmCfg)
+	if err != nil {
+		return nil, err
+	}
+	return &apmCfg, nil
 }
 
 // SetupSwitchboardClient sets up a switchboard client
@@ -320,4 +374,8 @@ func (dep *Dependencies) GetRulesetConfigMaps() map[string]workerhelper.RulesetC
 
 func (dep *Dependencies) GetSQSClient() *sqs.Client {
 	return dep.SQSClient
+}
+
+func (dep *Dependencies) GetAPMTracer() *apm.Tracer {
+	return dep.APMTracer
 }

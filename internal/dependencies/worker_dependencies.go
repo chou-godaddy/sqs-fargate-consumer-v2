@@ -19,6 +19,7 @@ import (
 	rgclient "github.com/gdcorp-domains/fulfillment-rg-client"
 	workerhelper "github.com/gdcorp-domains/fulfillment-worker-helper"
 	workflowHelper "github.com/gdcorp-domains/fulfillment-worker-helper"
+	"go.elastic.co/apm"
 )
 
 // WorkflowDependencies defines the interface used to pass dependencies down to the workflows
@@ -43,4 +44,5 @@ type WorkflowDependencies interface {
 	GetRulesetConfigMaps() map[string]workflowHelper.RulesetConfig
 	GetSQSClient() *sqs.Client
 	GetContactVerificationAPIClient() contactverification.Client
+	GetAPMTracer() *apm.Tracer
 }
